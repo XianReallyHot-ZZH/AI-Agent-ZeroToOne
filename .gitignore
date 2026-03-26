@@ -49,6 +49,18 @@ out/
 *.swo
 *~
 
+# AI Tools
+.claude/
+.trae/
+.cursor/
+.cursorrules
+.aider*
+.windsurf/
+
+# TypeScript
+*.tsbuildinfo
+next-env.d.ts
+
 # OS
 .DS_Store
 .DS_Store?
