@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <!-- 控制台日志 appender -->
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <!-- Agent 日志级别 -->
+    <logger name="com.example.agent" level="INFO"/>
+
+    <!-- Anthropic SDK 日志级别（减少噪音） -->
+    <logger name="com.anthropic" level="WARN"/>
+
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+    </root>
+</configuration>
