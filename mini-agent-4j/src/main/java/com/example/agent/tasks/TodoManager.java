@@ -42,8 +42,7 @@ public class TodoManager {
         for (int i = 0; i < rawItems.size(); i++) {
             Map<String, Object> item = (Map<String, Object>) rawItems.get(i);
             String id = String.valueOf(item.getOrDefault("id", String.valueOf(i + 1)));
-            String text = String.valueOf(item.getOrDefault("text",
-                    item.getOrDefault("content", ""))).trim();
+            String text = String.valueOf(item.getOrDefault("text", item.getOrDefault("content", ""))).trim();
             String status = String.valueOf(item.getOrDefault("status", "pending")).toLowerCase();
 
             if (text.isEmpty()) {

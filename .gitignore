@@ -85,3 +85,5 @@ htmlcov/
 *.bak
 *.tmp
 .cache/
+
+vendors/
