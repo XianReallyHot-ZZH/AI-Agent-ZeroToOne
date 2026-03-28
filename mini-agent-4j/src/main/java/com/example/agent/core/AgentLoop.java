@@ -51,6 +51,33 @@ public class AgentLoop {
     /** 最大 token 数 */
     private final long maxTokens;
 
+    /** 每轮工具执行后的回调（可选），null 表示不拦截 */
+    private RoundHook roundHook;
+
+    /**
+     * 每轮工具执行后的回调接口（可选）。
+     * <p>
+     * 用于注入额外内容（如 nag reminder）到工具结果中。
+     * 返回的 blocks 会被插入到工具结果列表的头部。
+     */
+    @FunctionalInterface
+    public interface RoundHook {
+        /**
+         * 每轮工具执行完毕后调用。
+         *
+         * @param toolNames 本轮调用的工具名称列表
+         * @return 要注入的额外内容块，或 null/空列表表示不注入
+         */
+        List<ContentBlockParam> afterRound(List<String> toolNames);
+    }
+
+    /**
+     * 设置每轮工具执行后的回调。
+     */
+    public void setRoundHook(RoundHook roundHook) {
+        this.roundHook = roundHook;
+    }
+
     /**
      * 创建 Agent 循环实例。
      *
@@ -121,11 +148,13 @@ public class AgentLoop {
 
             // ---- 4. 遍历 content blocks，执行工具调用 ----
             List<ContentBlockParam> toolResults = new ArrayList<>();
+            List<String> toolNames = new ArrayList<>();
 
             for (ContentBlock block : response.content()) {
                 if (block.isToolUse()) {
                     ToolUseBlock toolUse = block.asToolUse();
                     String toolName = toolUse.name();
+                    toolNames.add(toolName);
 
                     // 从 JsonValue 提取输入参数
                     @SuppressWarnings("unchecked")
@@ -140,6 +169,16 @@ public class AgentLoop {
                                     .toolUseId(toolUse.id())
                                     .content(output)
                                     .build()));
+                }
+            }
+
+            // ---- 4.5 调用 RoundHook（如 nag reminder） ----
+            if (roundHook != null) {
+                List<ContentBlockParam> extra = roundHook.afterRound(toolNames);
+                if (extra != null && !extra.isEmpty()) {
+                    List<ContentBlockParam> combined = new ArrayList<>(extra);
+                    combined.addAll(toolResults);
+                    toolResults = combined;
                 }
             }
 

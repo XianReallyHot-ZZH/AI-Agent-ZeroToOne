@@ -1,6 +1,9 @@
 package com.example.agent.sessions;
 
-import com.anthropic.models.messages.*;
+import com.anthropic.models.messages.ContentBlockParam;
+import com.anthropic.models.messages.MessageCreateParams;
+import com.anthropic.models.messages.TextBlockParam;
+import com.anthropic.models.messages.Tool;
 import com.example.agent.core.AgentLoop;
 import com.example.agent.core.ToolDispatcher;
 import com.example.agent.tasks.TodoManager;
@@ -11,7 +14,6 @@ import com.example.agent.tools.WriteTool;
 import com.example.agent.util.PathSandbox;
 
 import java.nio.file.Path;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Scanner;
@@ -84,8 +86,22 @@ public class S03TodoWrite {
         });
 
         // ---- 创建带 nag reminder 的 Agent 循环 ----
-        // 这里使用简化实现：nag 逻辑在 REPL 循环中手动管理
         AgentLoop agent = new AgentLoop(systemPrompt, tools, dispatcher);
+
+        // Nag reminder 状态：连续未调用 todo 的轮数
+        final int[] roundsSinceTodo = {0};
+
+        agent.setRoundHook(toolNames -> {
+            boolean usedTodo = toolNames.contains("todo");
+            roundsSinceTodo[0] = usedTodo ? 0 : roundsSinceTodo[0] + 1;
+            if (roundsSinceTodo[0] >= 3) {
+                return List.of(ContentBlockParam.ofText(
+                        TextBlockParam.builder()
+                                .text("<reminder>Update your todos. You haven't updated the task list recently.</reminder>")
+                                .build()));
+            }
+            return null;
+        });
 
         // ---- REPL ----
         MessageCreateParams.Builder paramsBuilder = agent.newParamsBuilder();
@@ -98,6 +114,7 @@ public class S03TodoWrite {
             if (query.isEmpty() || "q".equalsIgnoreCase(query) || "exit".equalsIgnoreCase(query)) break;
 
             paramsBuilder.addUserMessage(query);
+            roundsSinceTodo[0] = 0;  // 每次用户提问重置 nag 计数器
             try {
                 agent.agentLoop(paramsBuilder);
             } catch (Exception e) {
