@@ -28,19 +28,21 @@
 
 | 课程 | 主题 | 新增概念 | 运行命令 |
 |------|------|----------|----------|
-| S01 | Agent Loop | while 循环 + bash 工具 | `mvn exec:java -Dexec.mainClass=...S01AgentLoop` |
-| S02 | Tool Use | 工具分发表 (dispatch map) | `...S02ToolUse` |
-| S03 | TodoWrite | 结构化计划跟踪 + nag reminder | `...S03TodoWrite` |
-| S04 | Subagent | 上下文隔离（独立 messages=[]） | `...S04Subagent` |
-| S05 | Skill Loading | 两层技能注入（元数据 + 按需加载） | `...S05SkillLoading` |
-| S06 | Context Compact | 三层压缩管线（micro/auto/manual） | `...S06ContextCompact` |
-| S07 | Task System | 文件持久化 DAG 任务系统 | `...S07TaskSystem` |
-| S08 | Background Tasks | Virtual Thread 后台执行 + 通知队列 | `...S08BackgroundTasks` |
-| S09 | Agent Teams | JSONL 邮箱 + 持久化 Teammate | `...S09AgentTeams` |
-| S10 | Team Protocols | Shutdown / Plan Approval 握手协议 | `...S10TeamProtocols` |
-| S11 | Autonomous Agents | 空闲轮询 + 自动认领任务 | `...S11AutonomousAgents` |
-| S12 | Worktree Isolation | Git Worktree 目录级隔离 | `...S12WorktreeIsolation` |
-| SFull | Full Agent | 22 个工具全量整合 | `...SFullAgent` |
+| S01 | Agent Loop | while 循环 + bash 工具 | `mvn exec:java` / `java -jar mini-agent-4j.jar s01` |
+| S02 | Tool Use | 工具分发表 (dispatch map) | `... -Dexec.mainClass=...S02ToolUse` / `... s02` |
+| S03 | TodoWrite | 结构化计划跟踪 + nag reminder | `... S03TodoWrite` / `... s03` |
+| S04 | Subagent | 上下文隔离（独立 messages=[]） | `... S04Subagent` / `... s04` |
+| S05 | Skill Loading | 两层技能注入（元数据 + 按需加载） | `... S05SkillLoading` / `... s05` |
+| S06 | Context Compact | 三层压缩管线（micro/auto/manual） | `... S06ContextCompact` / `... s06` |
+| S07 | Task System | 文件持久化 DAG 任务系统 | `... S07TaskSystem` / `... s07` |
+| S08 | Background Tasks | Virtual Thread 后台执行 + 通知队列 | `... S08BackgroundTasks` / `... s08` |
+| S09 | Agent Teams | JSONL 邮箱 + 持久化 Teammate | `... S09AgentTeams` / `... s09` |
+| S10 | Team Protocols | Shutdown / Plan Approval 握手协议 | `... S10TeamProtocols` / `... s10` |
+| S11 | Autonomous Agents | 空闲轮询 + 自动认领任务 | `... S11AutonomousAgents` / `... s11` |
+| S12 | Worktree Isolation | Git Worktree 目录级隔离 | `... S12WorktreeIsolation` / `... s12` |
+| SFull | Full Agent | 22 个工具全量整合 | `... SFullAgent` / `... full` |
+
+> 表中左列为 `mvn exec:java` 方式（需在项目目录下），右列为 `java -jar` 方式（打包后可在任意目录运行）。
 
 ## 快速开始
 
@@ -63,12 +65,28 @@ cp .env.example .env
 # 3. 编译
 mvn compile
 
-# 4. 运行任意课程（以 S01 为例）
-mvn exec:java -Dexec.mainClass="com.example.agent.sessions.S01AgentLoop"
-
-# 5. 运行全量 Agent
-mvn exec:java -Dexec.mainClass="com.example.agent.sessions.SFullAgent"
+# 4. 运行任意课程（以 S03 为例）
+mvn exec:java -Dexec.mainClass="com.example.agent.sessions.S03TodoWrite"
 ```
+
+### 打包为可执行 jar（可在任意目录运行）
+
+```bash
+# 打包 fat jar（包含所有依赖）
+mvn clean package
+
+# 在任意目录运行，通过 session 名称指定课程
+java -jar target/mini-agent-4j-1.0-SNAPSHOT.jar s03          # S03TodoWrite
+java -jar target/mini-agent-4j-1.0-SNAPSHOT.jar s01          # S01AgentLoop
+java -jar target/mini-agent-4j-1.0-SNAPSHOT.jar full         # SFullAgent
+
+# 也可将 jar 复制到任意位置，在目标工作目录下运行
+cp target/mini-agent-4j-1.0-SNAPSHOT.jar ~/my-project/
+cd ~/my-project/
+java -jar mini-agent-4j-1.0-SNAPSHOT.jar s03
+```
+
+> `.env` 文件从运行时的工作目录向上查找；也可通过系统环境变量设置 `ANTHROPIC_API_KEY` 和 `MODEL_ID`。
 
 ### 环境变量
 
@@ -116,6 +134,7 @@ mini-agent-4j/
     │   │   └── Teammate.java        #   record 标识
     │   ├── worktree/                # Git Worktree 隔离
     │   │   └── WorktreeManager.java #   create/run/remove（s12）
+    │   ├── Launcher.java            #   统一启动入口（fat jar 入口）
     │   └── sessions/                # 13 节课程（独立可运行）
     │       ├── S01AgentLoop.java    #   最小循环
     │       ├── S02ToolUse.java      #   工具分发
