@@ -302,7 +302,7 @@ public class SFullAgent {
         for (int round = 0; round < 30; round++) {
             Message resp = agent.getClient().messages().create(subBuilder.build());
             subBuilder.addMessage(resp);
-            if (!StopReason.TOOL_USE.equals(resp.stopReason())) {
+            if (!resp.stopReason().map(StopReason.TOOL_USE::equals).orElse(false)) {
                 var texts = new ArrayList<String>();
                 for (ContentBlock b : resp.content()) {
                     b.text().ifPresent(tb -> texts.add(tb.text()));

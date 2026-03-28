@@ -177,7 +177,7 @@ public class TeamManager {
                 Message response = client.messages().create(paramsBuilder.build());
                 paramsBuilder.addMessage(response);
 
-                if (!StopReason.TOOL_USE.equals(response.stopReason())) {
+                if (!response.stopReason().map(StopReason.TOOL_USE::equals).orElse(false)) {
                     break;
                 }
 

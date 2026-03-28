@@ -110,7 +110,7 @@ public class AgentLoop {
             paramsBuilder.addMessage(response);
 
             // ---- 3. 检查是否需要继续执行工具 ----
-            if (!StopReason.TOOL_USE.equals(response.stopReason())) {
+            if (!response.stopReason().map(StopReason.TOOL_USE::equals).orElse(false)) {
                 // 模型决定停止，打印文本回复
                 for (ContentBlock block : response.content()) {
                     block.text().ifPresent(textBlock ->

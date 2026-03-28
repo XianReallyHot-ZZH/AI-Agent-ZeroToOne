@@ -53,7 +53,7 @@ public class S04Subagent {
             Message response = agent.getClient().messages().create(subBuilder.build());
             subBuilder.addMessage(response);
 
-            if (!StopReason.TOOL_USE.equals(response.stopReason())) {
+            if (!response.stopReason().map(StopReason.TOOL_USE::equals).orElse(false)) {
                 // 提取最终文本摘要返回给父 Agent
                 var texts = new ArrayList<String>();
                 for (ContentBlock block : response.content()) {
