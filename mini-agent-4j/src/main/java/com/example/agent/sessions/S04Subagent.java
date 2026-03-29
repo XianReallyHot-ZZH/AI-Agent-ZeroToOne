@@ -132,7 +132,7 @@ public class S04Subagent {
         parentDispatcher.register("task", input -> {
             String desc = (String) input.getOrDefault("description", "subtask");
             String prompt = (String) input.get("prompt");
-            System.out.println("> task (" + desc + "): " + prompt.substring(0, Math.min(80, prompt.length())));
+            System.out.println("> start task (" + desc + "): " + prompt.substring(0, Math.min(80, prompt.length())));
             return runSubagent(agent, prompt, childDispatcher, childTools);
         });
 

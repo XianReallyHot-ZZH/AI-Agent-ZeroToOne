@@ -27,9 +27,9 @@ import java.util.regex.Pattern;
  */
 public class SkillLoader {
 
-    /** YAML frontmatter 正则：--- 开头，--- 结尾，后跟正文 */
+    /** YAML frontmatter 正则：--- 开头，--- 结尾，后跟正文（兼容 CRLF / LF） */
     private static final Pattern FRONTMATTER_PATTERN =
-            Pattern.compile("^---\\n(.*?)\\n---\\n(.*)", Pattern.DOTALL);
+            Pattern.compile("^---\\r?\\n(.*?)\\r?\\n---\\r?\\n(.*)", Pattern.DOTALL);
 
     /** 技能名 -> {meta: Map, body: String} */
     private final Map<String, Map<String, Object>> skills = new LinkedHashMap<>();
@@ -75,8 +75,8 @@ public class SkillLoader {
     /**
      * 解析 YAML frontmatter。
      * <p>
-     * 对应 Python: _parse_frontmatter(text)
-     * 简单的 key: value 解析，不使用完整 YAML 解析器。
+     * 支持：简单 key: value、块标量 key: | (保留换行)、key: > (折叠换行)、缩进续行。
+     * 不引入完整 YAML 解析器，覆盖 SKILL.md 中常见的写法。
      */
     private Map<String, Object> parseFrontmatter(String text) {
         Matcher match = FRONTMATTER_PATTERN.matcher(text);
@@ -84,14 +84,63 @@ public class SkillLoader {
             return Map.of("meta", Map.of(), "body", text);
         }
 
+        String frontmatter = match.group(1);
+        String[] lines = frontmatter.split("\\r?\\n");
+
         Map<String, String> meta = new LinkedHashMap<>();
-        for (String line : match.group(1).strip().split("\n")) {
-            int colon = line.indexOf(':');
-            if (colon > 0) {
-                String key = line.substring(0, colon).strip();
-                String value = line.substring(colon + 1).strip();
-                meta.put(key, value);
+        int i = 0;
+        while (i < lines.length) {
+            String line = lines[i];
+            // 缩进行属于上一个 key 的续行，跳过（已在下面消费）
+            if (line.startsWith(" ") || line.startsWith("\t")) {
+                i++;
+                continue;
             }
+            int colon = line.indexOf(':');
+            if (colon <= 0) {
+                i++;
+                continue;
+            }
+
+            String key = line.substring(0, colon).strip();
+            String rest = line.substring(colon + 1).strip();
+
+            // 块标量 key: | 或 key: >
+            if (rest.equals("|") || rest.equals(">")) {
+                boolean literal = rest.equals("|");
+                StringBuilder sb = new StringBuilder();
+                i++;
+                while (i < lines.length) {
+                    String cont = lines[i];
+                    // 块标量结束条件：非空行且没有缩进
+                    if (!cont.isEmpty() && !cont.startsWith(" ") && !cont.startsWith("\t")) {
+                        break;
+                    }
+                    // 去掉公共缩进（至少一个空格/tab）
+                    if (!cont.isEmpty()) {
+                        cont = cont.replaceFirst("^[ \\t]{1,}", "");
+                    }
+                    sb.append(cont).append(literal ? "\n" : " ");
+                    i++;
+                }
+                String value = literal ? sb.toString().stripTrailing() : sb.toString().strip();
+                meta.put(key, value);
+                continue;
+            }
+
+            // 简单 key: value（可能跨行续行，如 Keywords: 那一行）
+            // 检查后续缩进行的续行
+            StringBuilder valueSb = new StringBuilder(rest);
+            i++;
+            while (i < lines.length) {
+                String cont = lines[i];
+                if (cont.isEmpty() || (!cont.startsWith(" ") && !cont.startsWith("\t"))) {
+                    break;
+                }
+                valueSb.append(" ").append(cont.strip());
+                i++;
+            }
+            meta.put(key, valueSb.toString().strip());
         }
 
         return Map.of("meta", meta, "body", match.group(2).strip());
