@@ -1,8 +1,7 @@
 package com.example.agent.team;
 
+import com.example.agent.util.Console;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -30,7 +29,6 @@ import java.util.concurrent.locks.ReentrantLock;
  */
 public class MessageBus {
 
-    private static final Logger log = LoggerFactory.getLogger(MessageBus.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     /** 有效消息类型 */
@@ -50,7 +48,7 @@ public class MessageBus {
         try {
             Files.createDirectories(inboxDir);
         } catch (IOException e) {
-            log.warn("创建 inbox 目录失败: {}", e.getMessage());
+            System.out.println(Console.red("创建 inbox 目录失败: " + e.getMessage()));
         }
     }
 
@@ -132,7 +130,7 @@ public class MessageBus {
             Files.writeString(inboxPath, "");
             return messages;
         } catch (IOException e) {
-            log.warn("读取收件箱失败: {}", e.getMessage());
+            System.out.println(Console.red("读取收件箱失败: " + e.getMessage()));
             return List.of();
         } finally {
             lock.unlock();

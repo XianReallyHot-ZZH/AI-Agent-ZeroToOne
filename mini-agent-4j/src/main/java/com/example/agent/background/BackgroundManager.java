@@ -1,7 +1,6 @@
 package com.example.agent.background;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import com.example.agent.util.Console;
 
 import java.io.IOException;
 import java.nio.file.Path;
@@ -32,8 +31,6 @@ import java.util.concurrent.TimeUnit;
  * Java 21 Virtual Thread 替代 Python threading.Thread，性能更优。
  */
 public class BackgroundManager {
-
-    private static final Logger log = LoggerFactory.getLogger(BackgroundManager.class);
 
     /** 所有后台任务：taskId -> {status, command, result} */
     private final ConcurrentHashMap<String, Map<String, Object>> tasks = new ConcurrentHashMap<>();
@@ -139,7 +136,8 @@ public class BackgroundManager {
                 "command", command.substring(0, Math.min(80, command.length())),
                 "result", result.substring(0, Math.min(500, result.length()))
         ));
-        log.info("[bg-task-{}] {} 完成: {}", taskId, status, result.substring(0, Math.min(100, result.length())));
+        System.out.println(Console.yellow("[bg-task-" + taskId + "] " + status + ": "
+                + result.substring(0, Math.min(100, result.length()))));
     }
 
     /**

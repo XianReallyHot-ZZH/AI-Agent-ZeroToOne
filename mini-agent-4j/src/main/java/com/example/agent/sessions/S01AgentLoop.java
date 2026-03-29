@@ -5,6 +5,7 @@ import com.anthropic.models.messages.Tool;
 import com.example.agent.core.AgentLoop;
 import com.example.agent.core.ToolDispatcher;
 import com.example.agent.tools.BashTool;
+import com.example.agent.util.Console;
 
 import java.nio.file.Path;
 import java.util.List;
@@ -58,7 +59,7 @@ public class S01AgentLoop {
         Scanner scanner = new Scanner(System.in);
 
         while (true) {
-            System.out.print("\033[36ms01 >> \033[0m");
+            System.out.print(Console.cyan("s01 >> "));
             if (!scanner.hasNextLine()) break;
 
             String query = scanner.nextLine().trim();

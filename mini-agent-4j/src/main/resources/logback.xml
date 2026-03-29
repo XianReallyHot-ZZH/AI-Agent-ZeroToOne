@@ -7,13 +7,13 @@
         </encoder>
     </appender>
 
-    <!-- Agent 日志级别 -->
-    <logger name="com.example.agent" level="INFO"/>
+    <!-- Agent 日志级别（工具日志已改用 System.out.println 彩色输出） -->
+    <logger name="com.example.agent" level="WARN"/>
 
     <!-- Anthropic SDK 日志级别（减少噪音） -->
     <logger name="com.anthropic" level="WARN"/>
 
-    <root level="INFO">
+    <root level="WARN">
         <appender-ref ref="CONSOLE"/>
     </root>
 </configuration>

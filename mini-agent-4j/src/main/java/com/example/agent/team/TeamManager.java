@@ -8,10 +8,9 @@ import com.example.agent.tools.BashTool;
 import com.example.agent.tools.EditTool;
 import com.example.agent.tools.ReadTool;
 import com.example.agent.tools.WriteTool;
+import com.example.agent.util.Console;
 import com.example.agent.util.PathSandbox;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -31,7 +30,6 @@ import java.util.*;
  */
 public class TeamManager {
 
-    private static final Logger log = LoggerFactory.getLogger(TeamManager.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private final Path teamDir;
@@ -189,8 +187,9 @@ public class TeamManager {
                         @SuppressWarnings("unchecked")
                         Map<String, Object> input = (Map<String, Object>) AgentLoop.jsonValueToObject(toolUse._input());
                         String output = dispatcher.dispatch(toolUse.name(), input != null ? input : Map.of());
-                        log.info("  [{}] {}: {}", name, toolUse.name(),
-                                output.substring(0, Math.min(120, output.length())));
+                        System.out.println(Console.dim("  [" + name + "] "
+                                + toolUse.name() + ": "
+                                + output.substring(0, Math.min(120, output.length()))));
                         results.add(ContentBlockParam.ofToolResult(
                                 ToolResultBlockParam.builder()
                                         .toolUseId(toolUse.id())
@@ -200,7 +199,7 @@ public class TeamManager {
                 }
                 paramsBuilder.addUserMessageOfBlockParams(results);
             } catch (Exception e) {
-                log.warn("[{}] Agent 循环异常: {}", name, e.getMessage());
+                System.out.println(Console.toolError("[" + name + "]", e.getMessage()));
                 break;
             }
         }

@@ -8,6 +8,7 @@ import com.example.agent.tools.BashTool;
 import com.example.agent.tools.EditTool;
 import com.example.agent.tools.ReadTool;
 import com.example.agent.tools.WriteTool;
+import com.example.agent.util.Console;
 import com.example.agent.util.PathSandbox;
 
 import java.nio.file.Path;
@@ -95,7 +96,7 @@ public class S07TaskSystem {
         Scanner scanner = new Scanner(System.in);
 
         while (true) {
-            System.out.print("\033[36ms07 >> \033[0m");
+            System.out.print(Console.cyan("s07 >> "));
             if (!scanner.hasNextLine()) break;
             String query = scanner.nextLine().trim();
             if (query.isEmpty() || "q".equalsIgnoreCase(query) || "exit".equalsIgnoreCase(query)) break;

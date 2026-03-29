@@ -5,8 +5,6 @@ import com.anthropic.client.okhttp.AnthropicOkHttpClient;
 import com.anthropic.core.JsonValue;
 import com.anthropic.models.messages.*;
 import com.example.agent.util.EnvLoader;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -30,8 +28,6 @@ import java.util.Map;
  * 对应 Python 原版：agent_loop(messages) 函数。
  */
 public class AgentLoop {
-
-    private static final Logger log = LoggerFactory.getLogger(AgentLoop.class);
 
     /** Anthropic API 客户端（线程安全，可复用） */
     private final AnthropicClient client;

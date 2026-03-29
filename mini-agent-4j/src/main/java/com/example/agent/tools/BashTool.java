@@ -1,8 +1,5 @@
 package com.example.agent.tools;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.nio.file.Path;
@@ -22,8 +19,6 @@ import java.util.concurrent.TimeUnit;
  * 对应 Python 原版：run_bash(command) 函数。
  */
 public final class BashTool {
-
-    private static final Logger log = LoggerFactory.getLogger(BashTool.class);
 
     /** 危险命令黑名单 */
     private static final List<String> DANGEROUS = List.of(

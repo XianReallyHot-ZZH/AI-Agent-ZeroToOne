@@ -1,8 +1,6 @@
 package com.example.agent.worktree;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -32,7 +30,6 @@ import java.util.regex.Pattern;
  */
 public class WorktreeManager {
 
-    private static final Logger log = LoggerFactory.getLogger(WorktreeManager.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     /** Worktree 名称正则：1-40 个字母/数字/点/下划线/横线 */

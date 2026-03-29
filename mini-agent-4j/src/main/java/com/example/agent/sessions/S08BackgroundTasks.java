@@ -8,6 +8,7 @@ import com.example.agent.tools.BashTool;
 import com.example.agent.tools.EditTool;
 import com.example.agent.tools.ReadTool;
 import com.example.agent.tools.WriteTool;
+import com.example.agent.util.Console;
 import com.example.agent.util.PathSandbox;
 
 import java.nio.file.Path;
@@ -97,10 +98,10 @@ public class S08BackgroundTasks {
                             .append(n.get("status")).append(": ")
                             .append(n.get("result")).append("\n");
                 }
-                System.out.println("\033[33m" + sb.toString().trim() + "\033[0m");
+                System.out.println(Console.yellow(sb.toString().trim()));
             }
 
-            System.out.print("\033[36ms08 >> \033[0m");
+            System.out.print(Console.cyan("s08 >> "));
             if (!scanner.hasNextLine()) break;
             String query = scanner.nextLine().trim();
             if (query.isEmpty() || "q".equalsIgnoreCase(query) || "exit".equalsIgnoreCase(query)) break;

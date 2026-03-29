@@ -1,8 +1,7 @@
 package com.example.agent.tasks;
 
+import com.example.agent.util.Console;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -27,7 +26,6 @@ import java.util.*;
  */
 public class TaskManager {
 
-    private static final Logger log = LoggerFactory.getLogger(TaskManager.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     /** 任务文件目录 */
@@ -41,7 +39,7 @@ public class TaskManager {
         try {
             Files.createDirectories(dir);
         } catch (IOException e) {
-            log.warn("创建 .tasks 目录失败: {}", e.getMessage());
+            System.out.println(Console.red("创建 .tasks 目录失败: " + e.getMessage()));
         }
         this.nextId = maxId() + 1;
     }

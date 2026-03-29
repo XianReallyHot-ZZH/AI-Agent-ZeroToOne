@@ -9,6 +9,7 @@ import com.example.agent.tools.BashTool;
 import com.example.agent.tools.EditTool;
 import com.example.agent.tools.ReadTool;
 import com.example.agent.tools.WriteTool;
+import com.example.agent.util.Console;
 import com.example.agent.util.PathSandbox;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
@@ -128,7 +129,7 @@ public class S09AgentTeams {
         Scanner scanner = new Scanner(System.in);
 
         while (true) {
-            System.out.print("\033[36ms09 >> \033[0m");
+            System.out.print(Console.cyan("s09 >> "));
             if (!scanner.hasNextLine()) break;
             String query = scanner.nextLine().trim();
             if (query.isEmpty() || "q".equalsIgnoreCase(query) || "exit".equalsIgnoreCase(query)) break;

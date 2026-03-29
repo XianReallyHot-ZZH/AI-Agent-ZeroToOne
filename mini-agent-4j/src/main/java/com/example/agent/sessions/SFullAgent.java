@@ -15,10 +15,9 @@ import com.example.agent.tools.BashTool;
 import com.example.agent.tools.EditTool;
 import com.example.agent.tools.ReadTool;
 import com.example.agent.tools.WriteTool;
+import com.example.agent.util.Console;
 import com.example.agent.util.PathSandbox;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -60,7 +59,6 @@ import java.util.Scanner;
  */
 public class SFullAgent {
 
-    private static final Logger log = LoggerFactory.getLogger(SFullAgent.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     /** 自动压缩阈值（token 数） */
@@ -207,7 +205,7 @@ public class SFullAgent {
         System.out.println("╚══════════════════════════════════════════╝");
 
         while (true) {
-            System.out.print("\033[36ms_full >> \033[0m");
+            System.out.print(Console.cyan("s_full >> "));
             if (!scanner.hasNextLine()) break;
             String query = scanner.nextLine().trim();
             if (query.isEmpty() || "q".equalsIgnoreCase(query) || "exit".equalsIgnoreCase(query)) break;

@@ -2,9 +2,8 @@ package com.example.agent.compress;
 
 import com.anthropic.client.AnthropicClient;
 import com.anthropic.models.messages.*;
+import com.example.agent.util.Console;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -29,7 +28,6 @@ import java.util.Map;
  */
 public class ContextCompressor {
 
-    private static final Logger log = LoggerFactory.getLogger(ContextCompressor.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     /** 保留最近 N 条 tool_result 不压缩 */
@@ -113,7 +111,7 @@ public class ContextCompressor {
                 sb.append(MAPPER.writeValueAsString(msg)).append("\n");
             }
             Files.writeString(transcriptPath, sb.toString());
-            log.info("[transcript saved: {}]", transcriptPath);
+            System.out.println(Console.dim("[transcript saved: " + transcriptPath + "]"));
 
             // 2. 调用 LLM 生成摘要
             String conversationText = MAPPER.writeValueAsString(messages);
@@ -143,7 +141,7 @@ public class ContextCompressor {
             return compressed;
 
         } catch (IOException e) {
-            log.warn("上下文压缩失败: {}", e.getMessage());
+            System.out.println(Console.red("上下文压缩失败: " + e.getMessage()));
             return new ArrayList<>(messages);
         }
     }

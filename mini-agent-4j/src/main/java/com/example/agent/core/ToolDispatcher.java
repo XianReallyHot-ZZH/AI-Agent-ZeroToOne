@@ -1,7 +1,6 @@
 package com.example.agent.core;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import com.example.agent.util.Console;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -23,7 +22,8 @@ import java.util.Map;
  */
 public class ToolDispatcher {
 
-    private static final Logger log = LoggerFactory.getLogger(ToolDispatcher.class);
+    /** 结果预览最大长度 */
+    private static final int PREVIEW_LEN = 500;
 
     /** 工具名 -> 处理器映射（保持注册顺序） */
     private final Map<String, ToolHandler> handlers = new LinkedHashMap<>();
@@ -53,15 +53,14 @@ public class ToolDispatcher {
             return "Error: Unknown tool: " + toolName;
         }
         try {
+            // 打印工具调用（粗体工具名 + 灰色参数）
+            System.out.println(Console.toolCall(toolName, input));
             String result = handler.handle(input);
-            // 日志输出前 200 字符（与 Python 版对齐）
-            String preview = result.length() > 200
-                    ? result.substring(0, 200) + "..."
-                    : result;
-            log.info("> {}: {}", toolName, preview);
+            // 打印工具结果（灰色缩进预览）
+            System.out.println(Console.toolResult(result, PREVIEW_LEN));
             return result;
         } catch (Exception e) {
-            log.warn("> {} 执行异常: {}", toolName, e.getMessage());
+            System.out.println(Console.toolError(toolName, e.getMessage()));
             return "Error: " + e.getMessage();
         }
     }
