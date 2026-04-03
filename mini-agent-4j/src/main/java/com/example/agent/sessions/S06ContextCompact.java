@@ -125,7 +125,8 @@ public class S06ContextCompact {
 
         while (true) {
             // ---- Layer 1: microCompact（每轮静默压缩，只针对tool_result结果，只保留最近的三条tool_result） ----
-            compressor.microCompact(messages);
+            // 效果不好，先注释掉
+//            compressor.microCompact(messages);
 
             // ---- Layer 2: autoCompact（token 超阈值时触发，效果是将历史对话都进行了压缩，只保留了一轮压缩后的对话） ----
             if (compressor.estimateTokens(messages) > THRESHOLD) {
