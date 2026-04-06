@@ -23,6 +23,52 @@ import java.util.*;
  * 关键洞察："状态存在对话之外——因为它在文件系统上。"
  * <p>
  * 对应 Python 原版：s07_task_system.py 中的 TaskManager 类。
+ * <p>
+ * <hr>
+ * <h3>已知局限性 &amp; 待改进项</h3>
+ *
+ * <h4>1. 性能：全量扫描，历史任务越多越慢</h4>
+ * <ul>
+ *   <li>{@link #listAll()} 和 {@link #clearDependency(int)} 都会扫描 .tasks/ 下所有 task_*.json，
+ *       逐个反序列化。时间复杂度 O(n)，n 为全部任务数量（含已完成）。</li>
+ *   <li>没有按状态分区或维护索引文件（如 index.json），已完成的任务与活跃任务混在一起，
+ *       每次操作都要为历史数据付出磁盘 IO 和 JSON 解析的代价。</li>
+ *   <li>{@code listAll()} 会把所有任务（含已完成）都返回给 LLM，大量 {@code [x]} 行
+ *       浪费上下文窗口 token。应支持过滤或归档已完成任务。</li>
+ * </ul>
+ *
+ * <h4>2. 并发安全：零保护，多线程/多实例不可用</h4>
+ * <ul>
+ *   <li>{@code nextId} 是普通 {@code int}，不是 {@code AtomicInteger}，也没有 {@code synchronized}。
+ *       两个线程同时调用 {@link #create(String, String)} 可能生成相同 ID，互相覆盖文件。</li>
+ *   <li>文件读写没有 {@link java.nio.channels.FileLock}。{@link #load(int)} + {@link #save(Map)}
+ *       之间存在 read-modify-write 竞态窗口：两个线程读同一任务 → 各自修改 → 后写覆盖先写。</li>
+ *   <li>{@link #update(int, String, List, List)} 中双向依赖写入（addBlocks 分支）和
+ *       {@link #clearDependency(int)} 的全量扫描在并发下都可能丢失更新。</li>
+ *   <li>当前 REPL 单线程使用没问题；多 agent 并行（如 S11/S12 方向）需补锁。</li>
+ * </ul>
+ *
+ * <h4>3. 数据一致性：删除不清理依赖、无环检测</h4>
+ * <ul>
+ *   <li>{@code update(taskId, "deleted", ...)} 直接删除文件，<b>没有调用</b>
+ *       {@link #clearDependency(int)}。其他任务的 {@code blockedBy}/{@code blocks} 数组中
+ *       会留下指向已删除任务的悬空 ID，造成"永远被阻塞"的死锁假象。</li>
+ *   <li>{@code addBlockedBy}/{@code addBlocks} 只是往 Set 里加 ID，没有检测是否形成环。
+ *       如果 A blockedBy B 且 B blockedBy A，两个任务都永远无法开始，且无机制发现此问题。
+ *       应在添加依赖时做 DAG 环检测。</li>
+ * </ul>
+ *
+ * <h4>4. 上下文膨胀：listAll 无过滤</h4>
+ * <ul>
+ *   <li>{@code listAll()} 把所有历史任务都返回给 LLM，随着任务积压，输出会越来越长，
+ *       挤占宝贵的上下文窗口。应支持 {@code status} 过滤参数，或自动归档已完成任务。</li>
+ * </ul>
+ *
+ * <p>
+ * <b>总结</b>：当前实现是 MVP / 教学演示级别，核心设计方向（文件持久化、DAG 依赖）
+ * 是正确的。生产化需补：(1) 索引或按状态分目录，避免全量扫描；(2) 文件锁或改为数据库，
+ * 解决并发安全；(3) 删除时清理依赖 + DAG 环检测，保证数据一致性；(4) 归档/清理策略，
+ * 控制上下文膨胀。
  */
 public class TaskManager {
 
