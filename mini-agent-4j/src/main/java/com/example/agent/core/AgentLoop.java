@@ -50,6 +50,9 @@ public class AgentLoop {
     /** 每轮工具执行后的回调（可选），null 表示不拦截 */
     private RoundHook roundHook;
 
+    /** 每次 LLM 调用前的回调（可选），null 表示不拦截 */
+    private PreLLMHook preLLMHook;
+
     /**
      * 每轮工具执行后的回调接口（可选）。
      * <p>
@@ -68,10 +71,39 @@ public class AgentLoop {
     }
 
     /**
+     * 每次 LLM 调用前的回调接口（可选）。
+     * <p>
+     * 用于在调用 LLM 前注入额外消息（如后台任务完成通知）。
+     * 返回的 user/assistant 消息对会被追加到对话历史中。
+     * <p>
+     * 与 {@link RoundHook} 对称：
+     * <ul>
+     *   <li>{@link RoundHook} — 工具执行后（S03 nag reminder）</li>
+     *   <li>{@link PreLLMHook} — LLM 调用前（S08 后台通知注入）</li>
+     * </ul>
+     */
+    @FunctionalInterface
+    public interface PreLLMHook {
+        /**
+         * 每次 LLM 调用前触发。
+         *
+         * @return 要注入的消息对列表（user + assistant），或 null/空列表表示不注入
+         */
+        List<ContentBlockParam> beforeLLMCall();
+    }
+
+    /**
      * 设置每轮工具执行后的回调。
      */
     public void setRoundHook(RoundHook roundHook) {
         this.roundHook = roundHook;
+    }
+
+    /**
+     * 设置每次 LLM 调用前的回调。
+     */
+    public void setPreLLMHook(PreLLMHook preLLMHook) {
+        this.preLLMHook = preLLMHook;
     }
 
     /**
@@ -126,6 +158,16 @@ public class AgentLoop {
      */
     public void agentLoop(MessageCreateParams.Builder paramsBuilder) {
         while (true) {
+            // ---- 0. 调用 PreLLMHook（如后台通知注入） ----
+            if (preLLMHook != null) {
+                List<ContentBlockParam> injected = preLLMHook.beforeLLMCall();
+                if (injected != null && !injected.isEmpty()) {
+                    paramsBuilder.addUserMessageOfBlockParams(injected);
+                    // 模型需要 "assistant 确认" 来保持对话连贯（与 Python 版一致）
+                    paramsBuilder.addAssistantMessage("Noted background results.");
+                }
+            }
+
             // ---- 1. 调用 LLM ----
             Message response = client.messages().create(paramsBuilder.build());
 

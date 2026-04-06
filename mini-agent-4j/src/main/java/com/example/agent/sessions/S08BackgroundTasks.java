@@ -82,24 +82,28 @@ public class S08BackgroundTasks {
                 bg.check((String) input.get("task_id")));
 
         // ---- REPL ----
-        // 注意：S08 的 AgentLoop 需要在每次 LLM 调用前 drain 后台通知
-        // 简化实现：在 REPL 循环中手动 drain
+        // S08 的核心：在每次 LLM 调用前 drain 后台通知并注入对话历史
+        // 这样 LLM 能看到后台任务的完成结果，并据此决定下一步操作
         AgentLoop agent = new AgentLoop(systemPrompt, tools, dispatcher);
+        agent.setPreLLMHook(() -> {
+            var notifs = bg.drainNotifications();
+            if (notifs.isEmpty()) return null;
+            var sb = new StringBuilder("<background-results>\n");
+            for (var n : notifs) {
+                sb.append("[bg:").append(n.get("task_id")).append("] ")
+                        .append(n.get("status")).append(": ")
+                        .append(n.get("result")).append("\n");
+            }
+            sb.append("</background-results>");
+            System.out.println(Console.yellow(sb.toString().replace("<background-results>\n", "")
+                    .replace("</background-results>", "").trim()));
+            return List.of(ContentBlockParam.ofText(
+                    TextBlockParam.builder().text(sb.toString()).build()));
+        });
         MessageCreateParams.Builder paramsBuilder = agent.newParamsBuilder();
         Scanner scanner = new Scanner(System.in);
 
         while (true) {
-            // 在用户输入前 drain 后台通知
-            var notifs = bg.drainNotifications();
-            if (!notifs.isEmpty()) {
-                var sb = new StringBuilder();
-                for (var n : notifs) {
-                    sb.append("[bg:").append(n.get("task_id")).append("] ")
-                            .append(n.get("status")).append(": ")
-                            .append(n.get("result")).append("\n");
-                }
-                System.out.println(Console.yellow(sb.toString().trim()));
-            }
 
             System.out.print(Console.cyan("s08 >> "));
             if (!scanner.hasNextLine()) break;
