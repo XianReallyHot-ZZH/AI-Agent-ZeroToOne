@@ -163,8 +163,6 @@ public class AgentLoop {
                 List<ContentBlockParam> injected = preLLMHook.beforeLLMCall();
                 if (injected != null && !injected.isEmpty()) {
                     paramsBuilder.addUserMessageOfBlockParams(injected);
-                    // 模型需要 "assistant 确认" 来保持对话连贯（与 Python 版一致）
-                    paramsBuilder.addAssistantMessage("Noted background results.");
                 }
             }
 
