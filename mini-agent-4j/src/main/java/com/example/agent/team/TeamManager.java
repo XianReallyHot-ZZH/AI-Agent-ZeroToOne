@@ -204,8 +204,11 @@ public class TeamManager {
             }
         }
 
-        // 更新状态
-        setStatus(name, "idle");
+        // 更新状态（若已被标记为 shutdown 则保持不变）
+        var member = findMember(name);
+        if (member != null && !"shutdown".equals(member.get("status"))) {
+            setStatus(name, "idle");
+        }
     }
 
     private synchronized void setStatus(String name, String status) {

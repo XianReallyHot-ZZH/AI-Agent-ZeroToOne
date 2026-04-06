@@ -14,6 +14,7 @@ import com.example.agent.util.PathSandbox;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Scanner;
@@ -83,7 +84,10 @@ public class S09AgentTeams {
                         Map.of(), null),
                 AgentLoop.defineTool("send_message", "Send a message to a teammate's inbox.",
                         Map.of("to", Map.of("type", "string"),
-                                "content", Map.of("type", "string")),
+                                "content", Map.of("type", "string"),
+                                "msg_type", Map.of("type", "string",
+                                        "enum", List.of("message", "broadcast", "shutdown_request",
+                                                "shutdown_response", "plan_approval_response"))),
                         List.of("to", "content")),
                 AgentLoop.defineTool("read_inbox", "Read and drain the lead's inbox.",
                         Map.of(), null),
@@ -112,7 +116,8 @@ public class S09AgentTeams {
         dispatcher.register("list_teammates", input -> teamMgr.listAll());
         dispatcher.register("send_message", input ->
                 bus.send("lead", (String) input.get("to"),
-                        (String) input.get("content"), "message", null));
+                        (String) input.get("content"),
+                        (String) input.getOrDefault("msg_type", "message"), null));
         dispatcher.register("read_inbox", input -> {
             try {
                 var messages = bus.readInbox("lead");
@@ -123,6 +128,20 @@ public class S09AgentTeams {
         });
         dispatcher.register("broadcast", input ->
                 bus.broadcast("lead", (String) input.get("content"), teamMgr.memberNames()));
+
+        // ---- Lead inbox 自动注入：每轮 LLM 调用前读取 lead 的收件箱 ----
+        agent.setPreLLMHook(() -> {
+            var inbox = bus.readInbox("lead");
+            if (inbox.isEmpty()) return null;
+            var blocks = new ArrayList<ContentBlockParam>();
+            try {
+                blocks.add(ContentBlockParam.ofText(TextBlockParam.builder()
+                        .text("<inbox>" + MAPPER.writerWithDefaultPrettyPrinter()
+                                .writeValueAsString(inbox) + "</inbox>")
+                        .build()));
+            } catch (Exception ignored) {}
+            return blocks;
+        });
 
         // ---- REPL ----
         MessageCreateParams.Builder paramsBuilder = agent.newParamsBuilder();
