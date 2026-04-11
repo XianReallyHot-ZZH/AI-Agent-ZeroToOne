@@ -11,19 +11,33 @@ import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.LocalDate;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
- * S02：工具分发 —— 完全自包含实现（不依赖 core/、tools/、util/ 包）。
+ * S10：系统提示词组装 —— 系统提示词是一条流水线，不是一坨硬编码字符串（完全自包含）。
  * <p>
- * Agent 循环没有任何变化。我们只是往工具数组里加了工具，
- * 然后用一个分发表（dispatch map）来路由调用。
+ * 本章教授一个核心理念：
+ * 系统提示词应该由清晰的段落组装而成，而不是写成一个巨大的硬编码块。
  * <p>
- * 关键洞察："循环根本没改。我只是加了工具。"
+ * 组装流水线：
+ *   1. core instructions       —— 身份和基本指令
+ *   2. tool listing            —— 可用工具列表及其参数
+ *   3. skill metadata          —— skills/ 目录下的 SKILL.md 前置元数据
+ *   4. memory section          —— .memory/ 目录下的持久化记忆
+ *   5. CLAUDE.md chain         —— 用户全局 + 项目根 + 子目录的 CLAUDE.md 链
+ *   6. dynamic context         —— 日期、工作目录、模型、平台
  * <p>
- * 本文件将所有基础设施内联：
+ * Builder 将稳定信息（1-5）与频繁变化的信息（6）分离。
+ * 一个简单的 DYNAMIC_BOUNDARY 标记使这个分界可见。
+ * <p>
+ * 关键洞察："系统提示词的构建是一条有边界的流水线，不是一个大字符串。"
+ * <p>
+ * 本文件零外部依赖（不导入 com.example.agent.*），所有基础设施内联：
  * - buildClient()：构建 Anthropic API 客户端
  * - loadModel()：从环境变量加载模型 ID
  * - defineTool()：构建 SDK Tool 定义
@@ -35,16 +49,15 @@ import java.util.function.Function;
  * - ANSI 输出：终端彩色文本
  * - agentLoop()：核心 LLM 调用 → 工具执行 → 结果回传循环
  * - jsonValueToObject()：JsonValue → 普通 Java 对象转换
+ * - SystemPromptBuilder 内部类：6 段落组装器
  * <p>
- * 并发安全分类（对应 Python 原版，本文档用途）：
- * - CONCURRENCY_SAFE = {read_file}   —— 只读，可并行
- * - CONCURRENCY_UNSAFE = {write_file, edit_file}  —— 有副作用，必须串行
+ * REPL 命令：/prompt, /sections
  * <p>
- * 对应 Python 原版：s02_tool_use.py
+ * 对应 Python 原版：s10_system_prompt.py
  *
- * @see <a href="../../../../../../vendors/learn-claude-code/agents/s02_tool_use.py">Python 原版</a>
+ * @see <a href="../../../../../../vendors/learn-claude-code/agents/s10_system_prompt.py">Python 原版</a>
  */
-public class S02ToolUse {
+public class S10SystemPrompt {
 
     // ==================== 常量 ====================
 
@@ -62,9 +75,12 @@ public class S02ToolUse {
     /** 工作目录（Agent 的文件操作沙箱根目录） */
     private static final Path WORK_DIR = Path.of(System.getProperty("user.dir")).toAbsolutePath().normalize();
 
-    /** 系统提示词：告诉模型它是一个编码 Agent，需要用工具完成任务 */
-    private static final String SYSTEM_PROMPT =
-            "You are a coding agent at " + WORK_DIR + ". Use tools to solve tasks. Act, don't explain.";
+    /** 静态段落与动态段落的分界标记。
+     * <p>
+     * 在真正的 Claude Code 中，静态前缀跨轮次缓存以节省 prompt tokens。
+     * DYNAMIC_BOUNDARY 之后的内容量每轮重建，不会被缓存。
+     */
+    private static final String DYNAMIC_BOUNDARY = "=== DYNAMIC_BOUNDARY ===";
 
     // ==================== ANSI 颜色输出 ====================
     // 终端彩色文本，让 REPL 和工具日志更易读
@@ -394,8 +410,8 @@ public class S02ToolUse {
             // 使用 Pattern.quote 确保字面量匹配（不解释正则元字符）
             // 使用 Matcher.quoteReplacement 确保替换文本中的特殊字符不被解释
             String updated = content.replaceFirst(
-                    java.util.regex.Pattern.quote(oldText),
-                    java.util.regex.Matcher.quoteReplacement(newText));
+                    Pattern.quote(oldText),
+                    Matcher.quoteReplacement(newText));
             Files.writeString(safePath, updated);
             return "Edited " + path;
 
@@ -469,6 +485,436 @@ public class S02ToolUse {
         return null;
     }
 
+    // ==================== SystemPromptBuilder 内部类 ====================
+
+    /**
+     * 系统提示词组装器：将提示词拆分为 6 个独立段落，每个段落职责单一。
+     * <p>
+     * 教学目标：让提示词更容易推理、更容易测试、更容易演进。
+     * <p>
+     * 6 个段落：
+     * <ol>
+     *   <li>_buildCore()         —— 身份和基本指令</li>
+     *   <li>_buildToolListing()  —— 可用工具列表</li>
+     *   <li>_buildSkillListing() —— skills/ 下的技能元数据</li>
+     *   <li>_buildMemorySection()—— .memory/ 下的持久化记忆</li>
+     *   <li>_buildClaudeMd()     —— CLAUDE.md 链（用户全局 + 项目 + 子目录）</li>
+     *   <li>_buildDynamicContext()—— 动态上下文（日期、平台、模型等）</li>
+     * </ol>
+     * <p>
+     * 段落 1-5 是稳定内容，可以跨轮次缓存；段落 6 每轮变化。
+     * DYNAMIC_BOUNDARY 标记在两组之间。
+     * <p>
+     * 对应 Python 原版：SystemPromptBuilder 类。
+     */
+    static class SystemPromptBuilder {
+
+        /** 工作目录，用于定位文件系统资源 */
+        private final Path workdir;
+
+        /** 工具定义列表，用于生成工具清单段落 */
+        private final List<Tool> tools;
+
+        /** 技能目录 */
+        private final Path skillsDir;
+
+        /** 记忆目录 */
+        private final Path memoryDir;
+
+        /** 模型 ID，用于动态上下文段落 */
+        private final String model;
+
+        /** 用于解析 SKILL.md / .memory/*.md 前置元数据的正则 */
+        private static final Pattern FRONTMATTER_PATTERN =
+                Pattern.compile("^---\\s*\\n(.*?)\\n---", Pattern.DOTALL);
+
+        /** 用于解析记忆文件的前置元数据 + 正文正则 */
+        private static final Pattern MEMORY_FRONTMATTER_PATTERN =
+                Pattern.compile("^---\\s*\\n(.*?)\\n---\\s*\\n(.*)", Pattern.DOTALL);
+
+        /**
+         * 构建系统提示词组装器。
+         *
+         * @param workdir 工作目录
+         * @param tools   工具定义列表
+         * @param model   模型 ID
+         */
+        SystemPromptBuilder(Path workdir, List<Tool> tools, String model) {
+            this.workdir = workdir;
+            this.tools = tools != null ? tools : List.of();
+            this.skillsDir = workdir.resolve("skills");
+            this.memoryDir = workdir.resolve(".memory");
+            this.model = model;
+        }
+
+        // ---- 段落 1：核心指令 ----
+
+        /**
+         * 构建核心身份和基本指令段落。
+         * <p>
+         * 告诉模型它是谁、在哪工作、应该如何行动。
+         * <p>
+         * 对应 Python 原版：_build_core() 方法。
+         *
+         * @return 核心指令文本
+         */
+        private String _buildCore() {
+            return "You are a coding agent operating in " + workdir + ".\n"
+                 + "Use the provided tools to explore, read, write, and edit files.\n"
+                 + "Always verify before assuming. Prefer reading files over guessing.";
+        }
+
+        // ---- 段落 2：工具清单 ----
+
+        /**
+         * 构建可用工具清单段落。
+         * <p>
+         * 遍历工具定义列表，为每个工具提取名称、参数和描述，
+         * 生成结构化的工具列表供模型参考。
+         * <p>
+         * 对应 Python 原版：_build_tool_listing() 方法。
+         *
+         * @return 工具清单文本，无工具时返回空字符串
+         */
+        @SuppressWarnings("unchecked")
+        private String _buildToolListing() {
+            if (tools.isEmpty()) {
+                return "";
+            }
+
+            List<String> lines = new ArrayList<>();
+            lines.add("# Available tools");
+
+            for (Tool tool : tools) {
+                // 从 InputSchema 中提取属性名列表
+                // SDK 方法：inputSchema() 返回 Tool.InputSchema，_properties() 返回 JsonValue
+                String params = "";
+                Tool.InputSchema schema = tool.inputSchema();
+                if (schema != null) {
+                    JsonValue propsJson = schema._properties();
+                    if (propsJson != null) {
+                        Object propsObj = jsonValueToObject(propsJson);
+                        if (propsObj instanceof Map) {
+                            @SuppressWarnings("unchecked")
+                            Map<String, Object> props = (Map<String, Object>) propsObj;
+                            params = String.join(", ", props.keySet());
+                        }
+                    }
+                }
+
+                String desc = tool.description().orElse("");
+                lines.add("- " + tool.name() + "(" + params + "): " + desc);
+            }
+
+            return String.join("\n", lines);
+        }
+
+        // ---- 段落 3：技能元数据 ----
+
+        /**
+         * 构建技能元数据段落（Layer 1 概念，来自 s05）。
+         * <p>
+         * 扫描 skills/ 目录下的子目录，查找 SKILL.md 文件，
+         * 解析前置元数据（frontmatter）中的 name 和 description 字段，
+         * 生成技能名称和描述列表。
+         * <p>
+         * 对应 Python 原版：_build_skill_listing() 方法。
+         *
+         * @return 技能列表文本，无技能时返回空字符串
+         */
+        private String _buildSkillListing() {
+            if (!Files.isDirectory(skillsDir)) {
+                return "";
+            }
+
+            List<String> skills = new ArrayList<>();
+
+            try {
+                // 按目录名排序，确保输出稳定
+                List<Path> sortedDirs = new ArrayList<>();
+                try (var stream = Files.list(skillsDir)) {
+                    stream.filter(Files::isDirectory)
+                          .sorted(Comparator.comparing(p -> p.getFileName().toString()))
+                          .forEach(sortedDirs::add);
+                }
+
+                for (Path skillDir : sortedDirs) {
+                    Path skillMd = skillDir.resolve("SKILL.md");
+                    if (!Files.exists(skillMd)) {
+                        continue;
+                    }
+
+                    String text = Files.readString(skillMd);
+
+                    // 解析前置元数据（frontmatter）：---\nkey: value\n---
+                    Matcher matcher = FRONTMATTER_PATTERN.matcher(text);
+                    if (!matcher.find()) {
+                        continue;
+                    }
+
+                    Map<String, String> meta = parseFrontmatter(matcher.group(1));
+                    String name = meta.getOrDefault("name", skillDir.getFileName().toString());
+                    String desc = meta.getOrDefault("description", "");
+                    skills.add("- " + name + ": " + desc);
+                }
+            } catch (Exception e) {
+                // 读取 skills 目录失败时静默忽略
+            }
+
+            if (skills.isEmpty()) {
+                return "";
+            }
+            return "# Available skills\n" + String.join("\n", skills);
+        }
+
+        // ---- 段落 4：记忆内容 ----
+
+        /**
+         * 构建记忆段落。
+         * <p>
+         * 扫描 .memory/ 目录下的 .md 文件，跳过 MEMORY.md 本身，
+         * 解析每个文件的前置元数据（frontmatter）中的 name、type、description，
+         * 以及正文内容。
+         * <p>
+         * 对应 Python 原版：_build_memory_section() 方法。
+         *
+         * @return 记忆内容文本，无记忆时返回空字符串
+         */
+        private String _buildMemorySection() {
+            if (!Files.isDirectory(memoryDir)) {
+                return "";
+            }
+
+            List<String> memories = new ArrayList<>();
+
+            try {
+                // 按文件名排序，确保输出稳定
+                List<Path> sortedFiles = new ArrayList<>();
+                try (var stream = Files.newDirectoryStream(memoryDir, "*.md")) {
+                    for (Path mdFile : stream) {
+                        // 跳过 MEMORY.md 本身（与 Python 原版行为一致）
+                        if (mdFile.getFileName().toString().equals("MEMORY.md")) {
+                            continue;
+                        }
+                        sortedFiles.add(mdFile);
+                    }
+                }
+                sortedFiles.sort(Comparator.comparing(p -> p.getFileName().toString()));
+
+                for (Path mdFile : sortedFiles) {
+                    String text = Files.readString(mdFile);
+
+                    // 解析前置元数据 + 正文
+                    Matcher matcher = MEMORY_FRONTMATTER_PATTERN.matcher(text);
+                    if (!matcher.find()) {
+                        continue;
+                    }
+
+                    String header = matcher.group(1);
+                    String body = matcher.group(2).trim();
+
+                    Map<String, String> meta = parseFrontmatter(header);
+                    String name = meta.getOrDefault("name", mdFile.getFileName().toString().replace(".md", ""));
+                    String memType = meta.getOrDefault("type", "project");
+                    String desc = meta.getOrDefault("description", "");
+
+                    memories.add("[" + memType + "] " + name + ": " + desc + "\n" + body);
+                }
+            } catch (Exception e) {
+                // 读取 .memory 目录失败时静默忽略
+            }
+
+            if (memories.isEmpty()) {
+                return "";
+            }
+            return "# Memories (persistent)\n\n" + String.join("\n\n", memories);
+        }
+
+        // ---- 段落 5：CLAUDE.md 链 ----
+
+        /**
+         * 构建 CLAUDE.md 指令链段落。
+         * <p>
+         * 按优先级顺序加载所有 CLAUDE.md 文件（全部包含，不互斥）：
+         * <ol>
+         *   <li>~/.claude/CLAUDE.md —— 用户全局指令</li>
+         *   <li>&lt;project-root&gt;/CLAUDE.md —— 项目根目录指令</li>
+         *   <li>&lt;current-subdir&gt;/CLAUDE.md —— 子目录特定指令</li>
+         * </ol>
+         * <p>
+         * 对应 Python 原版：_build_claude_md() 方法。
+         *
+         * @return CLAUDE.md 指令链文本，无文件时返回空字符串
+         */
+        private String _buildClaudeMd() {
+            List<Map.Entry<String, String>> sources = new ArrayList<>();
+
+            // 用户全局指令：~/.claude/CLAUDE.md
+            Path userHome = Path.of(System.getProperty("user.home"));
+            Path userClaude = userHome.resolve(".claude").resolve("CLAUDE.md");
+            if (Files.exists(userClaude)) {
+                try {
+                    String content = Files.readString(userClaude);
+                    sources.add(new AbstractMap.SimpleEntry<>(
+                            "user global (~/.claude/CLAUDE.md)", content));
+                } catch (Exception ignored) {
+                    // 读取失败时静默忽略
+                }
+            }
+
+            // 项目根目录：CLAUDE.md
+            Path projectClaude = workdir.resolve("CLAUDE.md");
+            if (Files.exists(projectClaude)) {
+                try {
+                    String content = Files.readString(projectClaude);
+                    sources.add(new AbstractMap.SimpleEntry<>(
+                            "project root (CLAUDE.md)", content));
+                } catch (Exception ignored) {
+                    // 读取失败时静默忽略
+                }
+            }
+
+            // 子目录：如果 cwd 与 workdir 不同，检查 cwd 下的 CLAUDE.md
+            Path cwd = Path.of(System.getProperty("user.dir")).toAbsolutePath().normalize();
+            if (!cwd.equals(workdir)) {
+                Path subdirClaude = cwd.resolve("CLAUDE.md");
+                if (Files.exists(subdirClaude)) {
+                    try {
+                        String content = Files.readString(subdirClaude);
+                        sources.add(new AbstractMap.SimpleEntry<>(
+                                "subdir (" + cwd.getFileName() + "/CLAUDE.md)", content));
+                    } catch (Exception ignored) {
+                        // 读取失败时静默忽略
+                    }
+                }
+            }
+
+            if (sources.isEmpty()) {
+                return "";
+            }
+
+            List<String> parts = new ArrayList<>();
+            parts.add("# CLAUDE.md instructions");
+            for (var entry : sources) {
+                parts.add("## From " + entry.getKey());
+                parts.add(entry.getValue().trim());
+            }
+            return String.join("\n\n", parts);
+        }
+
+        // ---- 段落 6：动态上下文 ----
+
+        /**
+         * 构建动态上下文段落。
+         * <p>
+         * 包含每轮可能变化的信息：
+         * - 当前日期
+         * - 工作目录
+         * - 模型 ID
+         * - 操作系统平台
+         * <p>
+         * 对应 Python 原版：_build_dynamic_context() 方法。
+         *
+         * @return 动态上下文文本
+         */
+        private String _buildDynamicContext() {
+            List<String> lines = new ArrayList<>();
+            lines.add("Current date: " + LocalDate.now().toString());
+            lines.add("Working directory: " + workdir);
+            lines.add("Model: " + model);
+            lines.add("Platform: " + System.getProperty("os.name"));
+            return "# Dynamic context\n" + String.join("\n", lines);
+        }
+
+        // ---- 前置元数据解析辅助 ----
+
+        /**
+         * 解析前置元数据（frontmatter）为键值对 Map。
+         * <p>
+         * frontmatter 格式为 YAML 子集：
+         * <pre>
+         * key1: value1
+         * key2: value2
+         * </pre>
+         * 每行按第一个冒号分割，trim 后存入 Map。
+         *
+         * @param frontmatterText frontmatter 文本（不含 --- 分隔符）
+         * @return 键值对 Map
+         */
+        private static Map<String, String> parseFrontmatter(String frontmatterText) {
+            Map<String, String> meta = new LinkedHashMap<>();
+            for (String line : frontmatterText.split("\n")) {
+                int colonIdx = line.indexOf(':');
+                if (colonIdx > 0) {
+                    String key = line.substring(0, colonIdx).trim();
+                    String value = line.substring(colonIdx + 1).trim();
+                    meta.put(key, value);
+                }
+            }
+            return meta;
+        }
+
+        // ---- 组装所有段落 ----
+
+        /**
+         * 组装完整的系统提示词。
+         * <p>
+         * 将 6 个段落按顺序拼接，段落之间用空行分隔。
+         * 静态段落（1-5）与动态段落（6）之间插入 DYNAMIC_BOUNDARY 标记。
+         * <p>
+         * 在真正的 Claude Code 中，静态前缀跨轮次缓存以节省 prompt tokens，
+         * 只有 DYNAMIC_BOUNDARY 之后的内容每轮重建。
+         * <p>
+         * 对应 Python 原版：build() 方法。
+         *
+         * @return 完整的系统提示词字符串
+         */
+        public String build() {
+            List<String> sections = new ArrayList<>();
+
+            // 段落 1：核心指令（始终存在）
+            String core = _buildCore();
+            if (!core.isEmpty()) {
+                sections.add(core);
+            }
+
+            // 段落 2：工具清单
+            String toolListing = _buildToolListing();
+            if (!toolListing.isEmpty()) {
+                sections.add(toolListing);
+            }
+
+            // 段落 3：技能元数据
+            String skillListing = _buildSkillListing();
+            if (!skillListing.isEmpty()) {
+                sections.add(skillListing);
+            }
+
+            // 段落 4：记忆内容
+            String memory = _buildMemorySection();
+            if (!memory.isEmpty()) {
+                sections.add(memory);
+            }
+
+            // 段落 5：CLAUDE.md 链
+            String claudeMd = _buildClaudeMd();
+            if (!claudeMd.isEmpty()) {
+                sections.add(claudeMd);
+            }
+
+            // 静态 / 动态分界标记
+            sections.add(DYNAMIC_BOUNDARY);
+
+            // 段落 6：动态上下文（始终存在）
+            String dynamic = _buildDynamicContext();
+            if (!dynamic.isEmpty()) {
+                sections.add(dynamic);
+            }
+
+            return String.join("\n\n", sections);
+        }
+    }
+
     // ==================== Agent 核心循环 ====================
 
     /**
@@ -483,23 +929,30 @@ public class S02ToolUse {
      *   }
      * </pre>
      * <p>
-     * 所有后续课程（s03-s12）都是在这个循环上增加"装置"（Harness），
-     * 循环本身从不改变。
+     * 与 S02 的区别：每次循环迭代都重新构建系统提示词（而非使用静态字符串），
+     * 以反映最新的动态上下文。在真正的 Claude Code 中，静态前缀会跨轮次缓存。
      * <p>
      * 对应 Python 原版：agent_loop(messages) 函数。
      *
-     * @param client      Anthropic API 客户端
-     * @param model       模型 ID
+     * @param client       Anthropic API 客户端
+     * @param model        模型 ID
      * @param paramsBuilder 消息创建参数构建器（包含已有对话历史）
-     * @param tools       工具定义列表（发送给 LLM）
+     * @param tools        工具定义列表（发送给 LLM）
      * @param toolHandlers 工具分发表：工具名 → 处理函数
+     * @param promptBuilder 系统提示词组装器（每轮重建）
      */
     @SuppressWarnings("unchecked")
     private static void agentLoop(AnthropicClient client, String model,
                                   MessageCreateParams.Builder paramsBuilder,
                                   List<Tool> tools,
-                                  Map<String, Function<Map<String, Object>, String>> toolHandlers) {
+                                  Map<String, Function<Map<String, Object>, String>> toolHandlers,
+                                  SystemPromptBuilder promptBuilder) {
         while (true) {
+            // ---- 0. 每轮重建系统提示词 ----
+            // 在真正的 Claude Code 中，静态前缀跨轮次缓存，只有动态部分重建
+            String system = promptBuilder.build();
+            paramsBuilder.system(system);
+
             // ---- 1. 调用 LLM ----
             Message response = client.messages().create(paramsBuilder.build());
 
@@ -564,13 +1017,15 @@ public class S02ToolUse {
      * 整体流程：
      * <pre>
      * while True:
-     *     query = input("s02 >> ")     # 读取用户输入
+     *     query = input("s10 >> ")     # 读取用户输入
      *     messages.append(query)       # 追加到历史
-     *     agent_loop(messages)         # 执行 Agent 循环
+     *     agent_loop(messages)         # 执行 Agent 循环（每轮重建 system prompt）
      * </pre>
      * <p>
-     * 与 S01 的区别仅仅是工具多了三个（read_file、write_file、edit_file），
-     * Agent 循环逻辑完全相同。
+     * 与 S02 的区别：
+     * - 系统提示词由 SystemPromptBuilder 组装（非硬编码字符串）
+     * - 每轮 Agent 循环重建系统提示词
+     * - 支持 /prompt 和 /sections REPL 命令
      */
     public static void main(String[] args) {
         // ---- 构建客户端和加载模型 ----
@@ -578,7 +1033,7 @@ public class S02ToolUse {
         String model = loadModel();
 
         // ---- 定义 4 个工具 ----
-        // 这是 S01（只有 bash）到 S02 的唯一变化：增加了 3 个文件操作工具
+        // bash, read_file, write_file, edit_file —— 与 S02 相同
         List<Tool> tools = List.of(
                 // bash：执行 shell 命令
                 defineTool("bash", "Run a shell command.",
@@ -610,7 +1065,6 @@ public class S02ToolUse {
 
         // ---- 工具分发表：工具名 → 处理函数 ----
         // 对应 Python 原版的 TOOL_HANDLERS 字典
-        // 这是"工具分发"的核心：一个简单的 Map 查找
         Map<String, Function<Map<String, Object>, String>> toolHandlers = new LinkedHashMap<>();
         toolHandlers.put("bash", input -> {
             String command = (String) input.get("command");
@@ -642,11 +1096,27 @@ public class S02ToolUse {
             return runEdit(path, oldText, newText);
         });
 
-        // ---- 构建消息参数（包含系统提示词、模型、工具、maxTokens） ----
+        // ---- 构建系统提示词组装器 ----
+        // 对应 Python 原版的 prompt_builder = SystemPromptBuilder(workdir=WORKDIR, tools=TOOLS)
+        SystemPromptBuilder promptBuilder = new SystemPromptBuilder(WORK_DIR, tools, model);
+
+        // ---- 启动时展示系统提示词概要（教学目的） ----
+        String fullPrompt = promptBuilder.build();
+        int sectionCount = 0;
+        for (String line : fullPrompt.split("\n")) {
+            if (line.startsWith("# ") || line.equals(DYNAMIC_BOUNDARY)) {
+                sectionCount++;
+            }
+        }
+        System.out.println(bold("S10 System Prompt")
+                + " — assembled: " + fullPrompt.length() + " chars, ~" + sectionCount + " sections");
+        System.out.println("Type 'q' or 'exit' to quit. Commands: /prompt, /sections\n");
+
+        // ---- 构建消息参数（包含模型、工具、maxTokens） ----
+        // 注意：system 由 promptBuilder 每轮动态设置，不在此处指定
         MessageCreateParams.Builder paramsBuilder = MessageCreateParams.builder()
                 .model(model)
-                .maxTokens(8000L)
-                .system(SYSTEM_PROMPT);
+                .maxTokens(8000L);
 
         for (Tool tool : tools) {
             paramsBuilder.addTool(tool);
@@ -654,12 +1124,10 @@ public class S02ToolUse {
 
         // ---- REPL 主循环 ----
         Scanner scanner = new Scanner(System.in);
-        System.out.println(bold("S02 Tool Use") + " — 4 tools: bash, read_file, write_file, edit_file");
-        System.out.println("Type 'q' or 'exit' to quit.\n");
 
         while (true) {
-            // 打印提示符（青色 "s02 >>"）
-            System.out.print(cyan("s02 >> "));
+            // 打印提示符（青色 "s10 >>"）
+            System.out.print(cyan("s10 >> "));
             if (!scanner.hasNextLine()) break;
 
             String query = scanner.nextLine().trim();
@@ -668,12 +1136,31 @@ public class S02ToolUse {
                 break;
             }
 
+            // /prompt 命令：显示完整组装的系统提示词
+            if (query.equals("/prompt")) {
+                System.out.println("--- System Prompt ---");
+                System.out.println(promptBuilder.build());
+                System.out.println("--- End ---");
+                continue;
+            }
+
+            // /sections 命令：只显示段落标题行
+            if (query.equals("/sections")) {
+                String prompt = promptBuilder.build();
+                for (String line : prompt.split("\n")) {
+                    if (line.startsWith("# ") || line.equals(DYNAMIC_BOUNDARY)) {
+                        System.out.println("  " + line);
+                    }
+                }
+                continue;
+            }
+
             // 追加用户消息到对话历史
             paramsBuilder.addUserMessage(query);
 
-            // 执行 Agent 循环（LLM 调用 + 工具执行）
+            // 执行 Agent 循环（LLM 调用 + 工具执行，每轮重建 system prompt）
             try {
-                agentLoop(client, model, paramsBuilder, tools, toolHandlers);
+                agentLoop(client, model, paramsBuilder, tools, toolHandlers, promptBuilder);
             } catch (Exception e) {
                 System.err.println(red("Error: " + e.getMessage()));
             }
