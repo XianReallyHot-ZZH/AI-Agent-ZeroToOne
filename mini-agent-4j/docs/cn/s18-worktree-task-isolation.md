@@ -1,6 +1,6 @@
-# s12：Worktree + 任务隔离
+# s18：Worktree + 任务隔离
 
-`s01 > s02 > s03 > s04 > s05 > s06 | s07 > s08 > s09 > s10 > s11 > [ s12 ]`
+`s01 > s02 > s03 > s04 > s05 > s06 | s07 > s08 > s09 > s10 > s11 > s12 > s13 > s14 > s15 > s16 > s17 > [ s18 ] s19`
 
 > *"按目录隔离，按任务 ID 协调。文件系统即隔离边界。"* —— 并行 Agent，零文件冲突。
 >
@@ -8,7 +8,7 @@
 
 ## 问题
 
-s11 的自治 Teammate 都在同一个目录下工作。如果 alice 和 bob 同时编辑 `UserService.java`，后写入的会覆盖前一个人的修改。你需要目录级隔离，让并行 Agent 能在同一仓库上工作而不产生文件冲突。
+s17 的自治 Teammate 都在同一个目录下工作。如果 alice 和 bob 同时编辑 `UserService.java`，后写入的会覆盖前一个人的修改。你需要目录级隔离，让并行 Agent 能在同一仓库上工作而不产生文件冲突。
 
 ## 方案
 
@@ -104,7 +104,7 @@ dispatcher.register("worktree_events", input ->
 
 ## 变更对比
 
-| 组件          | s11                 | s12                               |
+| 组件          | s17                 | s18                               |
 |---------------|---------------------|-----------------------------------|
 | 隔离          | 同一目录            | 每个任务一个 git worktree          |
 | 新工具        | （无）              | `worktree_create/list/status/run/remove/keep/events`（7 个工具） |
@@ -117,7 +117,7 @@ dispatcher.register("worktree_events", input ->
 
 ```sh
 cd mini-agent-4j
-mvn compile exec:java -Dexec.mainClass="com.example.agent.sessions.S12WorktreeIsolation"
+mvn compile exec:java -Dexec.mainClass="com.example.agent.sessions.S18WorktreeIsolation"
 ```
 
 1. `创建一个任务 "重构认证模块" 并创建绑定的 worktree`

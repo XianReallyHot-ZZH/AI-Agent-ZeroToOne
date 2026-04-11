@@ -1,6 +1,6 @@
-# s08：后台任务
+# s13：后台任务
 
-`s01 > s02 > s03 > s04 > s05 > s06 | s07 > [ s08 ] s09 > s10 > s11 > s12`
+`s01 > s02 > s03 > s04 > s05 > s06 | s07 > s08 > s09 > s10 > s11 > s12 > [ s13 ] s14 > s15 > s16 > s17 > s18 > s19`
 
 > *"发出即忘 —— Agent 不会因等待命令而阻塞。"* —— Virtual Thread 让并行变得轻而易举。
 >
@@ -85,7 +85,7 @@ dispatcher.register("check_background", input ->
 
 ## 变更对比
 
-| 组件          | s07                 | s08                               |
+| 组件          | s12                 | s13                               |
 |---------------|---------------------|-----------------------------------|
 | 执行模型      | 仅阻塞              | 阻塞 + 后台（Virtual Thread）     |
 | 新工具        | （无）              | `background_run`、`check_background` |
@@ -97,7 +97,7 @@ dispatcher.register("check_background", input ->
 
 ```sh
 cd mini-agent-4j
-mvn compile exec:java -Dexec.mainClass="com.example.agent.sessions.S08BackgroundTasks"
+mvn compile exec:java -Dexec.mainClass="com.example.agent.sessions.S13BackgroundTasks"
 ```
 
 1. `在后台运行 "mvn dependency:resolve"`

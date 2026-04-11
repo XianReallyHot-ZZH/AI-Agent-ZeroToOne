@@ -1,6 +1,6 @@
-# s07：任务系统
+# s12：任务系统
 
-`s01 > s02 > s03 > s04 > s05 > s06 | [ s07 ] s08 > s09 > s10 > s11 > s12`
+`s01 > s02 > s03 > s04 > s05 > s06 | s07 > s08 > s09 > s10 > s11 > [ s12 ] s13 > s14 > s15 > s16 > s17 > s18 > s19`
 
 > *"状态存在对话之外 —— 因为它在文件系统上。"* —— 任务能经受压缩、重启甚至崩溃。
 >
@@ -85,7 +85,7 @@ if ("completed".equals(status)) {
 
 ## 变更对比
 
-| 组件          | s06                 | s07                               |
+| 组件          | s11                 | s12                               |
 |---------------|---------------------|-----------------------------------|
 | 状态存储      | 内存中（TodoManager） | 基于文件 `.tasks/` JSON         |
 | 依赖关系      | （无）              | `blockedBy` / `blocks` DAG       |
@@ -97,7 +97,7 @@ if ("completed".equals(status)) {
 
 ```sh
 cd mini-agent-4j
-mvn compile exec:java -Dexec.mainClass="com.example.agent.sessions.S07TaskSystem"
+mvn compile exec:java -Dexec.mainClass="com.example.agent.sessions.S12TaskSystem"
 ```
 
 1. `创建一个任务计划：搭建项目、编写代码、添加测试（含依赖关系）`

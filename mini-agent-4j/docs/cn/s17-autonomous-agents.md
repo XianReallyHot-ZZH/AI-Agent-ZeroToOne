@@ -1,6 +1,6 @@
-# s11：自治 Agent
+# s17：自治 Agent
 
-`s01 > s02 > s03 > s04 > s05 > s06 | s07 > s08 > s09 > s10 > [ s11 ] s12`
+`s01 > s02 > s03 > s04 > s05 > s06 | s07 > s08 > s09 > s10 > s11 > s12 > s13 > s14 > s15 > s16 > [ s17 ] s18 > s19`
 
 > *"自治 = 有工作就做，没工作就等。Lead 只管发任务，不管分配。"* —— Teammate 自己找活干。
 >
@@ -8,7 +8,7 @@
 
 ## 问题
 
-s10 的 Teammate 等待明确指令。Lead 必须手动分配每个任务："alice，做任务 1。bob，做任务 2。"这不可扩展。你希望 Teammate 能从共享任务池中*拉取*任务，而不是等着被*推送*任务。
+s16 的 Teammate 等待明确指令。Lead 必须手动分配每个任务："alice，做任务 1。bob，做任务 2。"这不可扩展。你希望 Teammate 能从共享任务池中*拉取*任务，而不是等着被*推送*任务。
 
 ## 方案
 
@@ -88,7 +88,7 @@ IDLE 阶段：  调用 idle 工具 -> 轮询 pending 任务 -> claim_task -> 回
 
 ## 变更对比
 
-| 组件          | s10                 | s11                               |
+| 组件          | s16                 | s17                               |
 |---------------|---------------------|-----------------------------------|
 | 任务认领      | 手动分配            | 自主（Teammate 轮询 + 认领）      |
 | 新工具        | （无）              | `idle`、`claim_task`              |
@@ -100,7 +100,7 @@ IDLE 阶段：  调用 idle 工具 -> 轮询 pending 任务 -> claim_task -> 回
 
 ```sh
 cd mini-agent-4j
-mvn compile exec:java -Dexec.mainClass="com.example.agent.sessions.S11AutonomousAgents"
+mvn compile exec:java -Dexec.mainClass="com.example.agent.sessions.S17AutonomousAgents"
 ```
 
 1. `生成两个队友：alice（backend）和 bob（testing）`

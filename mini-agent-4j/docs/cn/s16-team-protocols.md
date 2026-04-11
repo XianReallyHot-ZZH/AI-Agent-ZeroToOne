@@ -1,6 +1,6 @@
-# s10：团队协议
+# s16：团队协议
 
-`s01 > s02 > s03 > s04 > s05 > s06 | s07 > s08 > s09 > [ s10 ] s11 > s12`
+`s01 > s02 > s03 > s04 > s05 > s06 | s07 > s08 > s09 > s10 > s11 > s12 > s13 > s14 > s15 > [ s16 ] s17 > s18 > s19`
 
 > *"协议 = 消息类型 + request_id 关联 + 状态机跟踪。"* —— 一种 FSM 模式，两种应用。
 >
@@ -8,7 +8,7 @@
 
 ## 问题
 
-s09 的 `send_message` 是非结构化的。当 Lead 想关闭一个 Teammate 时，发一条消息然后寄希望于对方执行。没有确认，没有追踪请求是被批准还是被拒绝。你需要带关联 ID 的结构化握手机制。
+s15 的 `send_message` 是非结构化的。当 Lead 想关闭一个 Teammate 时，发一条消息然后寄希望于对方执行。没有确认，没有追踪请求是被批准还是被拒绝。你需要带关联 ID 的结构化握手机制。
 
 ## 方案
 
@@ -79,7 +79,7 @@ pendingShutdowns.put(requestId, Map.of(
 ));
 ```
 
-4. **消息通过 MessageBus 传递。** 协议使用 s09 相同的 `bus.send()`，但使用结构化的消息类型：
+4. **消息通过 MessageBus 传递。** 协议使用 s15 相同的 `bus.send()`，但使用结构化的消息类型：
 
 ```
 { type: "shutdown_request", request_id: "uuid-1", from: "lead" }
@@ -90,7 +90,7 @@ pendingShutdowns.put(requestId, Map.of(
 
 ## 变更对比
 
-| 组件          | s09                 | s10                               |
+| 组件          | s15                 | s16                               |
 |---------------|---------------------|-----------------------------------|
 | 通信          | 非结构化消息        | 结构化协议（shutdown、plan）      |
 | 关联机制      | （无）              | `request_id`（UUID）              |
@@ -102,7 +102,7 @@ pendingShutdowns.put(requestId, Map.of(
 
 ```sh
 cd mini-agent-4j
-mvn compile exec:java -Dexec.mainClass="com.example.agent.sessions.S10TeamProtocols"
+mvn compile exec:java -Dexec.mainClass="com.example.agent.sessions.S16TeamProtocols"
 ```
 
 1. `生成一个叫 "alice" 的队友，角色是 "backend"`
