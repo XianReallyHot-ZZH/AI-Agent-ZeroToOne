@@ -47,18 +47,22 @@ import java.util.concurrent.locks.ReentrantLock;
  * <p>
  * Teammate 简化版生命周期（不含 idle 轮询和任务认领，那是 S17 的内容）：
  * <pre>
- *   while True:
- *     WORK PHASE: agent loop (最多 50 轮), 拦截 idle → 退出工作阶段
- *     IDLE: 简单退出（无轮询、无自动认领）
+ *   WORK PHASE: agent loop (最多 50 轮), LLM 自然停止（END_TURN）→ 退出工作阶段
+ *   完成后设为 idle 状态，可被 respawn 重新激活
  * </pre>
+ * <p>
+ * 与 S17 的关键区别：S15 没有 idle 工具和 idle 轮询阶段。
+ * Teammate 在工作阶段自然结束后直接 idle，不会自动寻找新任务。
+ * 这简化了生命周期，但代价是 Teammate 必须被 Lead 显式 respawn
+ * 才能再次工作。S17 通过 idle polling + 任务认领解决了这个问题。
  * <p>
  * REPL 命令：/team（查看团队状态）, /inbox（查看 lead 收件箱）
  * <p>
  * Lead 工具（9 个）：bash, read_file, write_file, edit_file,
  *   spawn_teammate, list_teammates, send_message, read_inbox, broadcast
  * <p>
- * Teammate 工具（7 个）：bash, read_file, write_file, edit_file,
- *   send_message, idle, read_inbox
+ * Teammate 工具（6 个）：bash, read_file, write_file, edit_file,
+ *   send_message, read_inbox
  * <p>
  * 关键洞察："Teammate 是有名字的、有记忆的、可以随时对话的长期合作者。"
  * <p>
@@ -823,14 +827,13 @@ public class S15AgentTeams {
          * <p>
          * 工作流程：
          * <pre>
-         * while True:
-         *   WORK PHASE:
-         *     for round in range(MAX_WORK_ROUNDS):
-         *       1. 读取收件箱
-         *       2. 调用 LLM
-         *       3. 执行工具（拦截 idle → 退出工作阶段）
-         *       4. 如果 LLM 停止（非 TOOL_USE）→ 退出工作阶段
-         *   IDLE: 退出循环，设置状态为 shutdown
+         * WORK PHASE:
+         *   for round in range(MAX_WORK_ROUNDS):
+         *     1. 读取收件箱
+         *     2. 调用 LLM
+         *     3. 执行工具
+         *     4. 如果 LLM 停止（非 TOOL_USE）→ 退出工作阶段
+         * 完成后设置状态为 idle
          * </pre>
          * <p>
          * 每个 teammate 有独立的 MessageCreateParams.Builder，
@@ -846,7 +849,7 @@ public class S15AgentTeams {
             String teamName = (String) config.getOrDefault("team_name", "default");
             String sysPrompt = "You are '" + name + "', role: " + role
                     + ", team: " + teamName + ", at " + WORKDIR + ". "
-                    + "Use idle tool when you have no more work.";
+                    + "Do your assigned work, then stop.";
 
             // ---- 构建 teammate 参数 ----
             // 每个 teammate 有自己独立的 paramsBuilder（对话历史）
@@ -855,8 +858,8 @@ public class S15AgentTeams {
                     .maxTokens(MAX_TOKENS)
                     .system(sysPrompt);
 
-            // ---- Teammate 工具集（7 个） ----
-            // bash, read_file, write_file, edit_file, send_message, idle, read_inbox
+            // ---- Teammate 工具集（6 个） ----
+            // bash, read_file, write_file, edit_file, send_message, read_inbox
             List<Tool> tools = List.of(
                     defineTool("bash", "Run a shell command.",
                             Map.of("command", Map.of("type", "string")),
@@ -877,10 +880,6 @@ public class S15AgentTeams {
                             Map.of("to", Map.of("type", "string"),
                                     "content", Map.of("type", "string")),
                             List.of("to", "content")),
-                    // idle 工具：teammate 表示"我没有更多工作了"
-                    // 调用 idle 后 teammate 退出工作阶段
-                    defineTool("idle", "Signal that you have no more work to do.",
-                            Map.of(), null),
                     defineTool("read_inbox", "Read and drain your inbox.",
                             Map.of(), null)
             );
@@ -892,8 +891,6 @@ public class S15AgentTeams {
             params.addUserMessage(prompt);
 
             // ---- WORK PHASE: 标准工作循环，最多 MAX_WORK_ROUNDS 轮 ----
-            boolean idleRequested = false;
-
             for (int round = 0; round < MAX_WORK_ROUNDS; round++) {
                 // 每轮开始前读取收件箱
                 List<Map<String, Object>> inbox = bus.readInbox(name);
@@ -934,23 +931,6 @@ public class S15AgentTeams {
                             ToolUseBlock tu = block.asToolUse();
                             String toolName = tu.name();
 
-                            // ===== 内联拦截 idle 工具 =====
-                            // idle 是特殊工具：不执行任何操作，
-                            // 而是让 teammate 退出工作阶段
-                            if ("idle".equals(toolName)) {
-                                idleRequested = true;
-                                String output = "No more work. Entering idle.";
-                                // 用灰色打印 teammate 的 idle 信号
-                                System.out.println(printDim(
-                                        "  [" + name + "] idle: " + output));
-                                results.add(ContentBlockParam.ofToolResult(
-                                        ToolResultBlockParam.builder()
-                                                .toolUseId(tu.id())
-                                                .content(output)
-                                                .build()));
-                                continue;
-                            }
-
                             // ===== 常规工具分发 =====
                             @SuppressWarnings("unchecked")
                             Map<String, Object> input = (Map<String, Object>)
@@ -979,9 +959,6 @@ public class S15AgentTeams {
                     // 将工具结果追加为 user 消息
                     params.addUserMessageOfBlockParams(results);
 
-                    // 如果 idle 被触发，退出工作循环
-                    if (idleRequested) break;
-
                 } catch (Exception e) {
                     // 发生异常时打印错误并退出
                     System.out.println(printRed(
@@ -991,17 +968,17 @@ public class S15AgentTeams {
                 }
             }
 
-            // ---- 工作阶段结束，设置状态为 shutdown ----
-            // S15 简化版：没有 idle 轮询阶段，直接退出
-            setMemberStatus(name, "shutdown");
-            System.out.println(printDim("  [" + name + "] shutdown."));
+            // ---- 工作阶段结束，设置状态为 idle ----
+            // S15 简化版：工作自然完成后设为 idle，可以被 respawn 重新激活
+            // 只有异常（见 catch 块）才设为 shutdown
+            setMemberStatus(name, "idle");
+            System.out.println(printDim("  [" + name + "] idle."));
         }
 
         /**
          * Teammate 工具分发器。
          * <p>
-         * 与 Lead 的工具集相比，teammate 只有 6 个常规工具
-         * （idle 在 teammateLoop 内联拦截，不经过分发器）。
+         * 与 Lead 的工具集相比，teammate 只有 6 个常规工具。
          *
          * @param name     teammate 名称（用于 send_message 的 sender 字段）
          * @param toolName 工具名称

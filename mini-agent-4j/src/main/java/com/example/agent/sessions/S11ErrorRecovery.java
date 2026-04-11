@@ -694,26 +694,35 @@ public class S11ErrorRecovery {
                         continue; // 压缩后重试
                     }
 
-                    // ---- 策略 3：连接/限速错误 -> 指数退避重试 ----
-                    if (attempt < MAX_RECOVERY_ATTEMPTS) {
-                        double delay = backoffDelay(attempt);
-                        System.out.println(yellow("[Recovery] API error: " + e.getMessage()
-                                + ". Retrying in " + String.format("%.1f", delay) + "s"
-                                + " (attempt " + (attempt + 1) + "/" + MAX_RECOVERY_ATTEMPTS + ")"));
-                        try {
-                            Thread.sleep((long) (delay * 1000));
-                        } catch (InterruptedException ie) {
-                            Thread.currentThread().interrupt();
-                            System.err.println(red("[Error] Interrupted during backoff."));
-                            return;
+                    // ---- 策略 3：网络错误（Connection/Timeout）-> 指数退避重试 ----
+                    String msg = e.getMessage() != null ? e.getMessage() : "";
+                    boolean isNetworkError = msg.contains("Connection")
+                            || msg.contains("Timeout")
+                            || msg.contains("timeout");
+                    if (isNetworkError) {
+                        if (attempt < MAX_RECOVERY_ATTEMPTS) {
+                            double delay = backoffDelay(attempt);
+                            System.out.println(yellow("[Recovery] Network error: " + e.getMessage()
+                                    + ". Retrying in " + String.format("%.1f", delay) + "s"
+                                    + " (attempt " + (attempt + 1) + "/" + MAX_RECOVERY_ATTEMPTS + ")"));
+                            try {
+                                Thread.sleep((long) (delay * 1000));
+                            } catch (InterruptedException ie) {
+                                Thread.currentThread().interrupt();
+                                System.err.println(red("[Error] Interrupted during backoff."));
+                                return;
+                            }
+                            continue;
                         }
-                        continue;
+
+                        // 网络错误重试耗尽
+                        System.err.println(red("[Error] Network error persisted after "
+                                + MAX_RECOVERY_ATTEMPTS + " retries: " + e.getMessage()));
+                        return;
                     }
 
-                    // 所有重试耗尽
-                    System.err.println(red("[Error] API call failed after "
-                            + MAX_RECOVERY_ATTEMPTS + " retries: " + e.getMessage()));
-                    return;
+                    // ---- 其他异常（编程 bug）-> 不重试，直接抛出 ----
+                    throw new RuntimeException("Unexpected error (likely a bug): " + e.getMessage(), e);
                 }
             }
 

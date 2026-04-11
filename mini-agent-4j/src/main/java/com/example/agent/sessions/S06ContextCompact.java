@@ -76,8 +76,11 @@ public class S06ContextCompact {
 
     // ---- 上下文压缩相关常量 ----
 
-    /** 自动压缩阈值：当估算 token 数超过此值时触发 auto-compact */
-    private static final int CONTEXT_LIMIT = 50000;
+    /** 自动压缩阈值：当估算 token 数超过此值时触发 auto-compact。
+     *  Python 原版使用 CONTEXT_LIMIT = 50000（以字符数为单位，len(str(messages)) > 50000）。
+     *  Java 版改为 12000，因为这里存储的是估算 token 数（charCount / 4），
+     *  即 12000 tokens * 4 chars/token ≈ 48000 字符，与 Python 的 50000 字符阈值基本等价。 */
+    private static final int CONTEXT_LIMIT = 12000;
 
     /** 大输出持久化阈值：工具输出超过此字符数时保存到文件（Python: PERSIST_THRESHOLD = 30000） */
     private static final int PERSIST_THRESHOLD = 30000;

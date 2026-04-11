@@ -368,9 +368,15 @@ public class S18WorktreeIsolation {
     }
 
     private static String worktreeRun(String name, String command) {
+        if (command == null || command.isBlank()) return "Error: command required";
+        for (String d : List.of("rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"))
+            if (command.contains(d)) return "Error: Dangerous command blocked";
         try { var wt=findWorktree(name); if (wt==null) return "Error: Unknown worktree '"+name+"'";
             Path path=Path.of((String)wt.get("path")); if (!Files.exists(path)) return "Error: Path missing: "+path;
-            ProcessBuilder pb=new ProcessBuilder("bash","-c",command); pb.directory(path.toFile()); pb.redirectErrorStream(true);
+            ProcessBuilder pb = System.getProperty("os.name").toLowerCase().contains("win")
+                ? new ProcessBuilder("cmd", "/c", command)
+                : new ProcessBuilder("bash", "-c", command);
+            pb.directory(path.toFile()); pb.redirectErrorStream(true);
             Process p=pb.start(); String o=new String(p.getInputStream().readAllBytes()).trim();
             if (!p.waitFor(300,TimeUnit.SECONDS)) { p.destroyForcibly(); return "Error: Timeout"; }
             return o.isEmpty()?"(no output)":(o.length()>50000?o.substring(0,50000):o);
@@ -438,7 +444,7 @@ public class S18WorktreeIsolation {
     }
 
     private static String runEdit(String path, String oldT, String newT) {
-        try { Path fp=safePath(path); String c=Files.readString(fp); if (!c.contains(oldT)) return "Error: Text not found"; Files.writeString(fp,c.replace(oldT,newT)); return "Edited "+path; } catch (Exception e) { return "Error: "+e.getMessage(); }
+        try { Path fp=safePath(path); String c=Files.readString(fp); if (!c.contains(oldT)) return "Error: Text not found"; int idx=c.indexOf(oldT); Files.writeString(fp,c.substring(0,idx)+newT+c.substring(idx+oldT.length())); return "Edited "+path; } catch (Exception e) { return "Error: "+e.getMessage(); }
     }
 
     @SuppressWarnings("unchecked")

@@ -114,6 +114,9 @@ public class S14CronScheduler {
     /** 循环任务自动过期天数 */
     private static final int AUTO_EXPIRY_DAYS = 7;
 
+    /** CronLock 锁文件路径，用于防止多个调度器实例同时运行 */
+    private static final Path CRON_LOCK_FILE = WORK_DIR.resolve(".claude").resolve("cron.lock");
+
     /** 需要抖动偏移的分钟数（避免在精确的 :00 和 :30 触发） */
     private static final List<Integer> JITTER_MINUTES = List.of(0, 30);
 
@@ -506,10 +509,98 @@ public class S14CronScheduler {
         /** 后台检查线程 */
         private Thread checkThread;
 
+        /** PID 文件锁实例 */
+        private final CronLock lock = new CronLock();
+
+        // ==================== CronLock 内部类 ====================
+
         /**
-         * 启动调度器：加载持久化任务，启动后台检查线程。
+         * PID 文件锁：防止多个调度器实例同时运行。
+         * <p>
+         * 为什么需要锁？如果用户在两个终端同时运行 S14，两个后台线程
+         * 都会每秒检查 cron 表达式，导致同一个任务被触发两次。
+         * CronLock 通过写入当前进程 PID 到锁文件来保证单实例运行。
+         * <p>
+         * 锁的获取逻辑：
+         * <ol>
+         *   <li>锁文件不存在 → 直接创建并写入当前 PID</li>
+         *   <li>锁文件存在，PID 对应进程已死 → 窃取锁（stale lock），覆盖写入</li>
+         *   <li>锁文件存在，PID 对应进程存活 → 拒绝获取（另一个实例正在运行）</li>
+         * </ol>
+         * <p>
+         * 使用 Java 9+ 的 {@link ProcessHandle} API 检测进程存活状态，
+         * 这比传统的 "kill -0" 方式更跨平台。
+         * <p>
+         * 对应 Python 原版的 PID 文件锁机制。
+         */
+        public static class CronLock {
+
+            /**
+             * 尝试获取锁。成功返回 true，锁已被其他存活进程持有时返回 false。
+             * <p>
+             * 流程：
+             * 1. 读取锁文件中的 PID
+             * 2. 如果 PID 对应的进程仍存活，拒绝获取
+             * 3. 如果进程已死或文件不存在，写入当前 PID 并返回 true
+             */
+            public boolean tryLock() {
+                try {
+                    if (Files.exists(CRON_LOCK_FILE)) {
+                        String content = Files.readString(CRON_LOCK_FILE).trim();
+                        if (!content.isEmpty()) {
+                            try {
+                                long pid = Long.parseLong(content);
+                                // 使用 ProcessHandle（Java 9+）检查进程是否存活
+                                Optional<ProcessHandle> handle = ProcessHandle.of(pid);
+                                if (handle.isPresent() && handle.get().isAlive()) {
+                                    System.err.println("[CronLock] Another scheduler is running (PID " + pid + ")");
+                                    return false;
+                                }
+                                // 进程已死，窃取锁
+                                System.out.println("[CronLock] Stale lock found (dead PID " + pid + "), stealing lock");
+                            } catch (NumberFormatException ignored) {
+                                // 锁文件内容无效，覆盖
+                            }
+                        }
+                    }
+
+                    // 写入当前进程 PID
+                    Files.createDirectories(CRON_LOCK_FILE.getParent());
+                    long myPid = ProcessHandle.current().pid();
+                    Files.writeString(CRON_LOCK_FILE, String.valueOf(myPid));
+                    System.out.println("[CronLock] Acquired lock (PID " + myPid + ")");
+                    return true;
+                } catch (Exception e) {
+                    System.err.println("[CronLock] Error acquiring lock: " + e.getMessage());
+                    return false;
+                }
+            }
+
+            /**
+             * 释放锁：删除锁文件。
+             */
+            public void release() {
+                try {
+                    if (Files.exists(CRON_LOCK_FILE)) {
+                        Files.delete(CRON_LOCK_FILE);
+                        System.out.println("[CronLock] Released lock");
+                    }
+                } catch (Exception e) {
+                    System.err.println("[CronLock] Error releasing lock: " + e.getMessage());
+                }
+            }
+        }
+
+        /**
+         * 启动调度器：获取锁、加载持久化任务、启动后台检查线程。
+         * <p>
+         * 如果无法获取 PID 锁（另一个调度器实例正在运行），则拒绝启动。
          */
         public void start() {
+            if (!lock.tryLock()) {
+                throw new IllegalStateException(
+                        "Another cron scheduler is already running. Delete " + CRON_LOCK_FILE + " if stale.");
+            }
             loadDurable();
             checkThread = new Thread(this::checkLoop, "cron-checker");
             checkThread.setDaemon(true);
@@ -521,7 +612,7 @@ public class S14CronScheduler {
         }
 
         /**
-         * 停止调度器：通知后台线程退出并等待其结束。
+         * 停止调度器：通知后台线程退出、等待其结束、释放锁。
          */
         public void stop() {
             stopRequested.set(true);
@@ -532,6 +623,7 @@ public class S14CronScheduler {
                     Thread.currentThread().interrupt();
                 }
             }
+            lock.release();
         }
 
         /**

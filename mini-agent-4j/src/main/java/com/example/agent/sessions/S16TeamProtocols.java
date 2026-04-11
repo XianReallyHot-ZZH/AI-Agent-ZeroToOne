@@ -937,7 +937,7 @@ public class S16TeamProtocols {
                         "from", name, "plan", planText, "status", "pending")));
 
                 // 发送到 lead 收件箱
-                bus.send(name, "lead", planText, "plan_approval_response",
+                bus.send(name, "lead", planText, "plan_approval",
                         Map.of("request_id", reqId, "plan", planText));
 
                 return "Plan submitted (request_id=" + reqId + "). Waiting for lead approval.";

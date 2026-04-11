@@ -40,7 +40,9 @@ public class S17AutonomousAgents {
     private static final long MAX_TOKENS = 8000;
     private static final int BASH_TIMEOUT_SECONDS = 120;
     private static final int MAX_OUTPUT = 50000;
+    /** IDLE 阶段轮询收件箱的间隔（秒） */
     private static final int POLL_INTERVAL_SECONDS = 5;
+    /** IDLE 阶段超时时间（秒），超时后 teammate 自动 shutdown */
     private static final int IDLE_TIMEOUT_SECONDS = 60;
     private static final String ANSI_RESET = "\033[0m";
     private static final String ANSI_YELLOW = "\033[33m";
@@ -357,8 +359,12 @@ public class S17AutonomousAgents {
                     resume = true; break;
                 }
 
-                // 扫描未认领任务
-                var unclaimed = scanUnclaimedTasks();
+                // 扫描未认领任务（按角色过滤）
+                // 角色过滤是 S17 的关键机制：任务可以通过 required_role 字段指定
+                // 只有特定角色的 teammate 才能认领。例如 "required_role": "coder"
+                // 的任务只会被 role="coder" 的 teammate 自动认领。
+                // 如果任务没有设置 required_role，则所有角色都可以认领。
+                var unclaimed = scanUnclaimedTasks(role);
                 if (!unclaimed.isEmpty()) {
                     var task = unclaimed.get(0);
                     int taskId = ((Number) task.get("id")).intValue();
@@ -405,15 +411,33 @@ public class S17AutonomousAgents {
         } catch (IOException e) { return "Error: "+e.getMessage(); }
     }
 
+    /**
+     * 扫描未认领的任务，按角色过滤。
+     * <p>
+     * 过滤条件（全部满足才会被返回）：
+     * 1. status == "pending"：只看未开始的任务
+     * 2. owner 为空：尚未被任何 teammate 认领
+     * 3. blockedBy 为空：没有未完成的依赖（有依赖的任务不能开始）
+     * 4. required_role 匹配：如果任务指定了 required_role，
+     *    则只返回给角色匹配的 teammate（实现任务→角色的精准分配）
+     *
+     * @param role 当前 teammate 的角色名称
+     * @return 可认领的任务列表（按 ID 排序）
+     */
     @SuppressWarnings("unchecked")
-    private static List<Map<String, Object>> scanUnclaimedTasks() {
+    private static List<Map<String, Object>> scanUnclaimedTasks(String role) {
         try (var s = Files.list(TASKS_DIR)) {
             var result = new ArrayList<Map<String, Object>>();
             for (var p : s.filter(p -> p.getFileName().toString().matches("task_\\d+\\.json")).sorted().toList()) {
                 try {
                     var t = (Map<String, Object>) MAPPER.readValue(Files.readString(p), Map.class);
-                    if ("pending".equals(t.get("status")) && (t.get("owner") == null || t.get("owner").toString().isEmpty())
-                            && ((List<?>) t.getOrDefault("blockedBy", List.of())).isEmpty()) result.add(t);
+                    if (!"pending".equals(t.get("status"))) continue;
+                    if (t.get("owner") != null && !t.get("owner").toString().isEmpty()) continue;
+                    if (!((List<?>) t.getOrDefault("blockedBy", List.of())).isEmpty()) continue;
+                    // 角色过滤：required_role 为空时所有角色都可认领，否则精确匹配
+                    String requiredRole = t.get("required_role") != null ? t.get("required_role").toString() : "";
+                    if (!requiredRole.isEmpty() && !requiredRole.equals(role)) continue;
+                    result.add(t);
                 } catch (Exception ignored) {}
             }
             return result;
@@ -528,7 +552,7 @@ public class S17AutonomousAgents {
     }
 
     private static String runEdit(String path, String oldT, String newT) {
-        try { Path fp=safePath(path); String c=Files.readString(fp); if (!c.contains(oldT)) return "Error: Text not found"; Files.writeString(fp,c.replace(oldT,newT)); return "Edited "+path; } catch (Exception e) { return "Error: "+e.getMessage(); }
+        try { Path fp=safePath(path); String c=Files.readString(fp); if (!c.contains(oldT)) return "Error: Text not found"; int idx=c.indexOf(oldT); Files.writeString(fp,c.substring(0,idx)+newT+c.substring(idx+oldT.length())); return "Edited "+path; } catch (Exception e) { return "Error: "+e.getMessage(); }
     }
 
     @SuppressWarnings("unchecked")

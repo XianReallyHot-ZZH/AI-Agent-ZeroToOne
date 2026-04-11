@@ -209,6 +209,8 @@ public class S13BackgroundTasks {
      * 主循环在每次 LLM 调用前 drain 队列，将结果注入对话。
      */
     static class BackgroundManager {
+        /** 停滞检测阈值（毫秒）：运行超过此时间的后台任务视为僵尸任务 */
+        private static final long STALL_THRESHOLD = 45_000;
         private final Map<String, Map<String, Object>> tasks = new ConcurrentHashMap<>();
         private final LinkedBlockingQueue<Map<String, String>> notifications = new LinkedBlockingQueue<>();
 
@@ -218,7 +220,8 @@ public class S13BackgroundTasks {
         String run(String command, int timeout) {
             String taskId = UUID.randomUUID().toString().substring(0, 8);
             tasks.put(taskId, new ConcurrentHashMap<>(Map.of(
-                    "status", "running", "command", command, "result", "")));
+                    "status", "running", "command", command, "result", "",
+                    "startedAt", System.currentTimeMillis())));
             Thread.ofVirtual().name("bg-" + taskId).start(() -> exec(taskId, command, timeout));
             return "Background task " + taskId + " started: " + command.substring(0, Math.min(80, command.length()));
         }
@@ -266,16 +269,65 @@ public class S13BackgroundTasks {
         }
 
         /**
-         * 排空通知队列，返回所有待处理通知。
+         * 排空通知队列，返回所有待处理通知（同 task_id 只保留最新一条）。
+         * <p>
+         * 通知折叠（folding）的原因：同一个后台任务可能产生多条通知
+         * （例如先 "running"，后 "completed"）。如果全部注入对话，
+         * 会浪费上下文窗口并混淆 LLM。折叠策略是同一个 task_id
+         * 只保留最后一条通知（HashMap 的 put 语义天然保证后覆盖前），
+         * 因为最新状态就是 LLM 最需要的信息。
          */
         List<Map<String, String>> drain() {
-            var result = new ArrayList<Map<String, String>>();
+            // 先检测停滞任务，将它们的通知也加入队列
+            detectStalled();
+
+            // 一次性排空队列中的所有通知
+            var raw = new ArrayList<Map<String, String>>();
             while (true) {
                 var n = notifications.poll();
                 if (n == null) break;
-                result.add(n);
+                raw.add(n);
             }
-            return result;
+
+            // 按 task_id 折叠：LinkedHashMap 保持插入顺序，
+            // 同一个 task_id 的后一条通知覆盖前一条
+            var folded = new LinkedHashMap<String, Map<String, String>>();
+            for (var n : raw) {
+                folded.put(n.get("task_id"), n);
+            }
+            return new ArrayList<>(folded.values());
+        }
+
+        /**
+         * 检测运行超过 STALL_THRESHOLD 的任务，标记为 error 并发送通知。
+         * <p>
+         * 停滞检测的目的是处理"僵尸任务"：后台线程可能因为子进程挂起、
+         * 死锁等原因永远无法完成。与其让这些任务永远处于 "running" 状态，
+         * 不如主动发现并将其标记为超时错误，这样 LLM 能在下一次 drain 时
+         * 看到失败结果并采取替代方案（如重试或换一种方法）。
+         *
+         * @return 停滞任务的摘要（无则返回空字符串）
+         */
+        String detectStalled() {
+            var stalled = new ArrayList<String>();
+            long now = System.currentTimeMillis();
+            for (var entry : tasks.entrySet()) {
+                var task = entry.getValue();
+                if ("running".equals(task.get("status"))) {
+                    Object startedAt = task.get("startedAt");
+                    long start = startedAt instanceof Number n ? n.longValue() : 0L;
+                    if (start > 0 && (now - start) > STALL_THRESHOLD) {
+                        task.putAll(Map.of("status", "error", "result", "Error: Task stalled (timeout)"));
+                        String taskId = entry.getKey();
+                        notifications.offer(Map.of(
+                                "task_id", taskId,
+                                "status", "error",
+                                "result", "Error: Task stalled (timeout)"));
+                        stalled.add(taskId);
+                    }
+                }
+            }
+            return stalled.isEmpty() ? "" : "Stalled tasks: " + String.join(", ", stalled);
         }
     }
 
@@ -335,7 +387,7 @@ public class S13BackgroundTasks {
     }
 
     private static String runEdit(String path, String oldText, String newText) {
-        try { Path fp = safePath(path); String c = Files.readString(fp); if (!c.contains(oldText)) return "Error: Text not found"; Files.writeString(fp, c.replace(oldText, newText)); return "Edited " + path; }
+        try { Path fp = safePath(path); String c = Files.readString(fp); if (!c.contains(oldText)) return "Error: Text not found"; Files.writeString(fp, c.substring(0, c.indexOf(oldText)) + newText + c.substring(c.indexOf(oldText) + oldText.length())); return "Edited " + path; }
         catch (Exception e) { return "Error: " + e.getMessage(); }
     }
 

@@ -298,12 +298,49 @@ public class S12TaskSystem {
             if (addBlockedBy != null) {
                 List<Integer> bb = (List<Integer>) task.getOrDefault("blockedBy", new ArrayList<>());
                 bb.addAll(addBlockedBy);
+                // 去重：LinkedHashSet 保持插入顺序的同时去除重复依赖
                 task.put("blockedBy", new ArrayList<>(new LinkedHashSet<>(bb)));
+
+                // ---- 双向 DAG 维护：正向边（blockedBy）→ 反向边（blocks）----
+                // 当前任务声明 "我被 blockerId 阻塞" 时，
+                // 需要同步在 blockerId 的 "blocks" 列表中添加当前任务，
+                // 这样完成任务时只需查 blocker 的 blocks 列表就知道该解锁谁。
+                for (int blockerId : addBlockedBy) {
+                    try {
+                        var blocker = load(blockerId);
+                        List<Integer> blockerBlocks = (List<Integer>) blocker.getOrDefault("blocks", new ArrayList<>());
+                        if (!blockerBlocks.contains(taskId)) {
+                            blockerBlocks.add(taskId);
+                            blocker.put("blocks", new ArrayList<>(new LinkedHashSet<>(blockerBlocks)));
+                            save(blocker);
+                        }
+                    } catch (IllegalArgumentException ignored) {
+                        // 依赖的阻塞任务不存在，跳过（允许悬空依赖）
+                    }
+                }
             }
             if (addBlocks != null) {
                 List<Integer> bl = (List<Integer>) task.getOrDefault("blocks", new ArrayList<>());
                 bl.addAll(addBlocks);
                 task.put("blocks", new ArrayList<>(new LinkedHashSet<>(bl)));
+
+                // ---- 双向 DAG 维护：反向边（blocks）→ 正向边（blockedBy）----
+                // 当前任务声明 "我阻塞了 blockedId" 时，
+                // 需要同步在 blockedId 的 "blockedBy" 列表中添加当前任务。
+                // 与上面的正向→反向逻辑是对称的，保证无论从哪一边建立依赖都能双向一致。
+                for (int blockedId : addBlocks) {
+                    try {
+                        var blocked = load(blockedId);
+                        List<Integer> blockedBy = (List<Integer>) blocked.getOrDefault("blockedBy", new ArrayList<>());
+                        if (!blockedBy.contains(taskId)) {
+                            blockedBy.add(taskId);
+                            blocked.put("blockedBy", new ArrayList<>(new LinkedHashSet<>(blockedBy)));
+                            save(blocked);
+                        }
+                    } catch (IllegalArgumentException ignored) {
+                        // 被阻塞的任务不存在，跳过
+                    }
+                }
             }
             save(task);
             return toJson(task);
@@ -418,7 +455,7 @@ public class S12TaskSystem {
             Path fp = safePath(path);
             String content = Files.readString(fp);
             if (!content.contains(oldText)) return "Error: Text not found in " + path;
-            Files.writeString(fp, content.replace(oldText, newText));
+            Files.writeString(fp, content.substring(0, content.indexOf(oldText)) + newText + content.substring(content.indexOf(oldText) + oldText.length()));
             return "Edited " + path;
         } catch (Exception e) { return "Error: " + e.getMessage(); }
     }

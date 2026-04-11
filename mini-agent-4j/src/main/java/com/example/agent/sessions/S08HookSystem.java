@@ -885,6 +885,22 @@ public class S08HookSystem {
                         case 'n':  sb.append('\n'); break;
                         case 't':  sb.append('\t'); break;
                         case 'r':  sb.append('\r'); break;
+                        case 'b':  sb.append('\b'); break;
+                        case 'f':  sb.append('\f'); break;
+                        case 'u':
+                            // Unicode escape: consume next 4 hex chars
+                            if (pos + 4 <= input.length()) {
+                                String hex = input.substring(pos, pos + 4);
+                                try {
+                                    sb.append((char) Integer.parseInt(hex, 16));
+                                    pos += 4;
+                                } catch (NumberFormatException e) {
+                                    // 无效的十六进制，原样追加
+                                    sb.append("\\u").append(hex);
+                                    pos += 4;
+                                }
+                            }
+                            break;
                         default:   sb.append(next); break;
                     }
                 } else {

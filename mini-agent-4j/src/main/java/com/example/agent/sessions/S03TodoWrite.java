@@ -665,14 +665,6 @@ public class S03TodoWrite {
             return String.join("\n", lines);
         }
 
-        /**
-         * 检查是否有未完成的计划项。
-         * <p>
-         * 用于 nag reminder 判断：只有存在未完成项时才催促。
-         */
-        public boolean hasOpenItems() {
-            return items.stream().anyMatch(item -> !"completed".equals(item.status));
-        }
     }
 
     // ==================== Agent 核心循环 ====================
@@ -786,33 +778,6 @@ public class S03TodoWrite {
             // API 要求 tool_result 必须以 user 角色发送
             paramsBuilder.addUserMessageOfBlockParams(toolResults);
         }
-    }
-
-    // ==================== 从消息历史提取最终文本 ====================
-
-    /**
-     * 从消息内容块列表中提取纯文本。
-     * <p>
-     * Agent 循环结束后，最后一条 assistant 消息可能包含多个文本块。
-     * 本方法将它们拼接成完整的输出文本，用于在 REPL 中显示。
-     * <p>
-     * 对应 Python 原版：extract_text(content) 函数。
-     *
-     * @param content 消息内容（ContentBlock 列表）
-     * @return 拼接后的纯文本，如果没有文本则返回空字符串
-     */
-    private static String extractText(List<ContentBlock> content) {
-        if (content == null) return "";
-        StringBuilder sb = new StringBuilder();
-        for (ContentBlock block : content) {
-            if (block != null) {
-                block.text().ifPresent(textBlock -> {
-                    if (!sb.isEmpty()) sb.append("\n");
-                    sb.append(textBlock.text());
-                });
-            }
-        }
-        return sb.toString().trim();
     }
 
     // ==================== 主程序入口 ====================
@@ -938,9 +903,6 @@ public class S03TodoWrite {
         Scanner scanner = new Scanner(System.in);
         System.out.println(bold("S03 Todo Write") + " — 5 tools: bash, read_file, write_file, edit_file, todo");
         System.out.println("Type 'q' or 'exit' to quit.\n");
-
-        // 用列表来保存历史消息，以便在循环外读取最后一条 assistant 消息
-        List<Message> messageHistory = new ArrayList<>();
 
         while (true) {
             // 打印提示符（青色 "s03 >>"）

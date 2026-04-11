@@ -173,7 +173,9 @@ public class S05SkillLoading {
         }
 
         try {
-            ProcessBuilder pb = new ProcessBuilder("bash", "-c", command);
+            ProcessBuilder pb = System.getProperty("os.name").toLowerCase().contains("win")
+                    ? new ProcessBuilder("cmd", "/c", command)
+                    : new ProcessBuilder("bash", "-c", command);
             pb.directory(WORKDIR.toFile());
             pb.redirectErrorStream(true);
             Process process = pb.start();

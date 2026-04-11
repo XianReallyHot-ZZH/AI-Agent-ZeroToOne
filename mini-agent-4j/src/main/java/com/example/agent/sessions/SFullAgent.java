@@ -56,10 +56,12 @@ public class SFullAgent {
     private static final String ANSI_DIM = "\033[2m";
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
+    /** 主动压缩的 token 估算阈值（字符数 / 4 约等于 token 数） */
     private static final long TOKEN_THRESHOLD = 100000;
+    /** Teammate IDLE 阶段轮询间隔（秒） */
     private static final int POLL_INTERVAL_SECONDS = 5;
+    /** Teammate IDLE 阶段超时（秒），超时后自动 shutdown */
     private static final int IDLE_TIMEOUT_SECONDS = 60;
-    private static final int KEEP_RECENT = 3;
 
     // ---- 路径 ----
     private static final Path TASKS_DIR = WORKDIR.resolve(".tasks");
@@ -177,6 +179,15 @@ public class SFullAgent {
     }
 
     // ==================== 完整 Agent 循环 ====================
+    //
+    // 整合了 s01-s18 的全部机制，每次 LLM 调用前执行三步预处理：
+    //   1. Auto-compact（s06）：token 估算超过阈值时自动压缩对话历史
+    //   2. Drain 后台通知（s13）：将后台任务完成结果注入对话
+    //   3. Drain lead 收件箱（s15）：将 teammate 消息注入对话
+    //
+    // 工具执行后还有两个后处理步骤：
+    //   6. Nag reminder（s03）：连续 3 轮未更新 todo 时插入提醒
+    //   7. Manual compress（s06）：如果 LLM 调用了 compress 工具，触发压缩
 
     private static void fullAgentLoop(Map<String, java.util.function.Function<Map<String, Object>, String>> dispatch) {
         int roundsWithoutTodo = 0;
@@ -243,7 +254,9 @@ public class SFullAgent {
                 conversationLog.add("tool("+tu.name()+"): "+output.substring(0, Math.min(200,output.length())));
             }
 
-            // ---- 6. Nag reminder ----
+            // ---- 6. Nag reminder（s03 机制） ----
+            // 如果有未完成的 todo 项但连续 3 轮没有使用 TodoWrite，
+            // 在工具结果前插入提醒消息，促使 LLM 更新待办列表状态
             roundsWithoutTodo = usedTodo ? 0 : roundsWithoutTodo + 1;
             if (todo.hasOpenItems() && roundsWithoutTodo >= 3) {
                 results.add(0, ContentBlockParam.ofText(TextBlockParam.builder().text("<reminder>Update your todos.</reminder>").build()));
@@ -259,68 +272,136 @@ public class SFullAgent {
     // ==================== 工具分发注册 ====================
 
     private static void registerDispatchers(Map<String, java.util.function.Function<Map<String, Object>, String>> dispatch) {
-        // 基础工具
+        // 基础工具（s02）
         dispatch.put("bash", input -> runBash((String) input.get("command")));
         dispatch.put("read_file", input -> runRead((String) input.get("path"), input.get("limit") instanceof Number n ? n.intValue() : null));
         dispatch.put("write_file", input -> runWrite((String) input.get("path"), (String) input.get("content")));
         dispatch.put("edit_file", input -> runEdit((String) input.get("path"), (String) input.get("old_text"), (String) input.get("new_text")));
-        // TodoWrite
+        // 待办清单（s03）
         dispatch.put("TodoWrite", input -> { @SuppressWarnings("unchecked") List<?> items = (List<?>) input.get("items"); return todo.update(items); });
-        // Subagent
+        // 子代理（s04）
         dispatch.put("task", input -> runSubagent((String) input.get("prompt"), (String) input.getOrDefault("agent_type", "Explore")));
-        // Skills
+        // 技能系统（s05）
         dispatch.put("load_skill", input -> skills.load((String) input.get("name")));
-        // Compress
+        // 手动压缩（s06）
         dispatch.put("compress", input -> "Compressing...");
-        // Background
+        // 后台任务（s13）
         dispatch.put("background_run", input -> bg.run((String) input.get("command"), input.get("timeout") instanceof Number n ? n.intValue() : 120));
         dispatch.put("check_background", input -> bg.check((String) input.get("task_id")));
-        // Tasks
+        // 持久化任务板（s12）
         dispatch.put("task_create", input -> createTask((String) input.get("subject"), (String) input.getOrDefault("description","")));
         dispatch.put("task_get", input -> getTask(((Number) input.get("task_id")).intValue()));
         dispatch.put("task_update", input -> { @SuppressWarnings("unchecked") List<Integer> bb = (List<Integer>) input.get("add_blocked_by"); @SuppressWarnings("unchecked") List<Integer> bl = (List<Integer>) input.get("add_blocks"); return updateTask(((Number) input.get("task_id")).intValue(), (String) input.get("status"), bb, bl); });
         dispatch.put("task_list", input -> listTasks());
-        // Inbox
+        // 收件箱（s15）
         dispatch.put("read_inbox", input -> { try { return MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(bus.readInbox("lead")); } catch (Exception e) { return "[]"; } });
-        // Autonomous
+        // 自治工具（s17）
         dispatch.put("idle", input -> "Lead does not idle.");
         dispatch.put("claim_task", input -> claimTask(((Number) input.get("task_id")).intValue(), "lead"));
-        // Team
+        // 团队协作（s15）
         dispatch.put("spawn_teammate", input -> spawnTeammate((String) input.get("name"), (String) input.get("role"), (String) input.get("prompt")));
         dispatch.put("list_teammates", input -> listAll());
         dispatch.put("send_message", input -> bus.send("lead", (String) input.get("to"), (String) input.get("content"), (String) input.getOrDefault("msg_type","message"), null));
         dispatch.put("broadcast", input -> bus.broadcast("lead", (String) input.get("content"), memberNames()));
-        // Protocols
+        // 协议工具（s16）
         dispatch.put("shutdown_request", input -> handleShutdownRequest((String) input.get("teammate")));
         dispatch.put("plan_approval", input -> handlePlanReview((String) input.get("request_id"), Boolean.TRUE.equals(input.get("approve")), (String) input.getOrDefault("feedback","")));
     }
 
     // ==================== 23 个工具定义 ====================
+    //
+    // 工具按来源/功能分组：
+    //
+    // 【基础工具】(s02) — 文件系统和命令行操作
+    //   1. bash          — 执行 shell 命令（OS 自适应、危险命令拦截、超时）
+    //   2. read_file     — 读取文件内容（路径沙箱、可选行数限制）
+    //   3. write_file    — 写入文件（自动创建父目录、路径沙箱）
+    //   4. edit_file     — 精确文本替换（首次匹配、Pattern.quote 字面量）
+    //
+    // 【Todo 工具】(s03) — 短期任务清单（内存态）
+    //   5. TodoWrite     — 更新待办列表（最多 20 项、仅 1 个 in_progress）
+    //
+    // 【子代理】(s04) — 隔离的一次性任务委派
+    //   6. task          — 派生子代理执行探索或通用任务（最多 30 轮）
+    //
+    // 【技能系统】(s05) — 专业知识加载
+    //   7. load_skill    — 从 skills/ 目录加载技能文件（SKILL.md）
+    //
+    // 【压缩】(s06) — 上下文管理
+    //   8. compress      — 手动触发对话压缩（替换历史为摘要）
+    //
+    // 【后台任务】(s13) — 非阻塞命令执行
+    //   9. background_run    — 后台执行命令，立即返回 task_id
+    //  10. check_background  — 检查后台任务状态
+    //
+    // 【持久化任务板】(s12) — 文件系统级任务管理
+    //  11. task_create   — 创建持久化任务（.tasks/task_N.json）
+    //  12. task_get      — 获取任务详情
+    //  13. task_update   — 更新任务状态/依赖（含双向 DAG 维护）
+    //  14. task_list     — 列出所有任务
+    //
+    // 【团队协作】(s15/s16/s17) — 多 Agent 管理
+    //  15. spawn_teammate — 生成持久化自治 Teammate（虚拟线程）
+    //  16. list_teammates — 列出所有 Teammate 及状态
+    //  17. send_message   — 发送消息给 Teammate
+    //  18. read_inbox     — 读取并清空 lead 收件箱
+    //  19. broadcast      — 广播消息给所有 Teammate
+    //
+    // 【协议工具】(s16) — Teammate 间握手协议
+    //  20. shutdown_request — 请求 Teammate 关闭（request_id 关联）
+    //  21. plan_approval    — 审批/拒绝 Teammate 的计划
+    //
+    // 【自治工具】(s17) — idle 轮询和任务认领
+    //  22. idle          — Teammate 声明无更多工作（触发 idle phase）
+    //  23. claim_task    — 从任务板认领任务（按角色过滤）
 
     private static List<Tool> buildFullToolList() {
         return List.of(
+                // 1. 执行 shell 命令
                 defineTool("bash", "Run a shell command.", Map.of("command", Map.of("type","string")), List.of("command")),
+                // 2. 读取文件内容
                 defineTool("read_file", "Read file contents.", Map.of("path",Map.of("type","string"),"limit",Map.of("type","integer")), List.of("path")),
+                // 3. 写入文件
                 defineTool("write_file", "Write content to file.", Map.of("path",Map.of("type","string"),"content",Map.of("type","string")), List.of("path","content")),
+                // 4. 精确文本替换
                 defineTool("edit_file", "Replace exact text in file.", Map.of("path",Map.of("type","string"),"old_text",Map.of("type","string"),"new_text",Map.of("type","string")), List.of("path","old_text","new_text")),
+                // 5. 更新待办清单（s03 内存态）
                 defineTool("TodoWrite", "Update task tracking list.", Map.of("items", Map.of("type","array","items",Map.of("type","object","properties",Map.of("content",Map.of("type","string"),"status",Map.of("type","string","enum",List.of("pending","in_progress","completed")),"activeForm",Map.of("type","string")),"required",List.of("content","status","activeForm")))), List.of("items")),
+                // 6. 子代理——隔离的一次性任务委派（s04）
                 defineTool("task", "Spawn a subagent for isolated exploration or work.", Map.of("prompt",Map.of("type","string"),"agent_type",Map.of("type","string","enum",List.of("Explore","general-purpose"))), List.of("prompt")),
+                // 7. 加载技能——专业知识注入（s05）
                 defineTool("load_skill", "Load specialized knowledge by name.", Map.of("name",Map.of("type","string")), List.of("name")),
+                // 8. 手动触发对话压缩（s06）
                 defineTool("compress", "Manually compress conversation context.", Map.of(), null),
+                // 9. 后台执行命令（s13）
                 defineTool("background_run", "Run command in background thread.", Map.of("command",Map.of("type","string"),"timeout",Map.of("type","integer")), List.of("command")),
+                // 10. 检查后台任务状态（s13）
                 defineTool("check_background", "Check background task status.", Map.of("task_id",Map.of("type","string")), null),
+                // 11. 创建持久化任务（s12 文件系统级）
                 defineTool("task_create", "Create a persistent file task.", Map.of("subject",Map.of("type","string"),"description",Map.of("type","string")), List.of("subject")),
+                // 12. 获取任务详情（s12）
                 defineTool("task_get", "Get task details by ID.", Map.of("task_id",Map.of("type","integer")), List.of("task_id")),
+                // 13. 更新任务状态/依赖（s12，含双向 DAG 维护）
                 defineTool("task_update", "Update task status or dependencies.", Map.of("task_id",Map.of("type","integer"),"status",Map.of("type","string","enum",List.of("pending","in_progress","completed","deleted")),"add_blocked_by",Map.of("type","array","items",Map.of("type","integer")),"add_blocks",Map.of("type","array","items",Map.of("type","integer"))), List.of("task_id")),
+                // 14. 列出所有任务（s12）
                 defineTool("task_list", "List all tasks.", Map.of(), null),
+                // 15. 生成持久化自治 Teammate（s17）
                 defineTool("spawn_teammate", "Spawn a persistent autonomous teammate.", Map.of("name",Map.of("type","string"),"role",Map.of("type","string"),"prompt",Map.of("type","string")), List.of("name","role","prompt")),
+                // 16. 列出所有 Teammate（s15）
                 defineTool("list_teammates", "List all teammates.", Map.of(), null),
+                // 17. 发送消息给 Teammate（s15）
                 defineTool("send_message", "Send a message to a teammate.", Map.of("to",Map.of("type","string"),"content",Map.of("type","string"),"msg_type",Map.of("type","string","enum",List.of("message","broadcast","shutdown_request","shutdown_response","plan_approval_response"))), List.of("to","content")),
+                // 18. 读取并清空 lead 收件箱（s15）
                 defineTool("read_inbox", "Read and drain the lead's inbox.", Map.of(), null),
+                // 19. 广播消息给所有 Teammate（s15）
                 defineTool("broadcast", "Send message to all teammates.", Map.of("content",Map.of("type","string")), List.of("content")),
+                // 20. 请求 Teammate 关闭（s16 shutdown 协议）
                 defineTool("shutdown_request", "Request a teammate to shut down.", Map.of("teammate",Map.of("type","string")), List.of("teammate")),
+                // 21. 审批/拒绝 Teammate 的计划（s16 plan approval 协议）
                 defineTool("plan_approval", "Approve or reject a teammate's plan.", Map.of("request_id",Map.of("type","string"),"approve",Map.of("type","boolean"),"feedback",Map.of("type","string")), List.of("request_id","approve")),
+                // 22. Teammate 声明无更多工作（s17 idle phase 触发器）
                 defineTool("idle", "Enter idle state.", Map.of(), null),
+                // 23. 从任务板认领任务（s17）
                 defineTool("claim_task", "Claim a task from the board.", Map.of("task_id",Map.of("type","integer")), List.of("task_id"))
         );
     }
@@ -507,7 +588,13 @@ public class SFullAgent {
         return "(subagent reached max rounds)";
     }
 
-    // ==================== Compression (s06) ====================
+    // ==================== Compression（s06 上下文压缩） ====================
+    //
+    // 压缩流程：
+    // 1. 将当前对话日志保存到 .transcripts/ 目录（可追溯）
+    // 2. 截取最后 80000 字符，调用 LLM 生成结构化摘要
+    // 3. 用摘要重建 paramsBuilder（替换整个历史）
+    // 4. 重置 token 估算计数器
 
     private static void doAutoCompact() {
         try {
@@ -630,7 +717,19 @@ public class SFullAgent {
         return "Spawned '"+name+"' (role: "+role+")";
     }
 
-    /** 持久化 Teammate：work→idle→work 循环 */
+    /**
+     * 持久化 Teammate 工作循环（s17 自治生命周期）。
+     * <p>
+     * 两阶段循环：
+     * <pre>
+     * while (true):
+     *   WORK PHASE:  标准 agent 循环（最多 50 轮），LLM 自然停止或调用 idle → 退出
+     *   IDLE PHASE:  轮询收件箱和未认领任务（每 5 秒，最多 60 秒）
+     *     ├─ 收件箱有消息 → 恢复 WORK
+     *     ├─ 有未认领任务 → 自动认领 → 恢复 WORK
+     *     └─ 超时 → shutdown（退出循环）
+     * </pre>
+     */
     private static void teammateLoop(String name, String role, String prompt) {
         String teamName = (String)teamConfig.getOrDefault("team_name","default");
         var params = MessageCreateParams.builder().model(modelId).maxTokens(MAX_TOKENS).system("You are '"+name+"', role: "+role+", team: "+teamName+", at "+WORKDIR+". Use idle when done. You may auto-claim tasks.");
@@ -727,7 +826,7 @@ public class SFullAgent {
 
     private static String runWrite(String path, String content) { try { Path fp=safePath(path); Files.createDirectories(fp.getParent()); Files.writeString(fp,content); return "Wrote "+content.length()+" bytes"; } catch (Exception e) { return "Error: "+e.getMessage(); } }
 
-    private static String runEdit(String path, String oldT, String newT) { try { Path fp=safePath(path); String c=Files.readString(fp); if (!c.contains(oldT)) return "Error: Text not found"; Files.writeString(fp,c.replace(oldT,newT)); return "Edited "+path; } catch (Exception e) { return "Error: "+e.getMessage(); } }
+    private static String runEdit(String path, String oldT, String newT) { try { Path fp=safePath(path); String c=Files.readString(fp); if (!c.contains(oldT)) return "Error: Text not found"; int idx=c.indexOf(oldT); Files.writeString(fp,c.substring(0,idx)+newT+c.substring(idx+oldT.length())); return "Edited "+path; } catch (Exception e) { return "Error: "+e.getMessage(); } }
 
     @SuppressWarnings("unchecked")
     private static Object jsonValueToObject(JsonValue value) {
