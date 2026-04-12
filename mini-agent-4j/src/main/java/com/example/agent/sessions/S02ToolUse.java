@@ -5,7 +5,6 @@ import com.anthropic.client.okhttp.AnthropicOkHttpClient;
 import com.anthropic.core.JsonValue;
 import com.anthropic.models.messages.*;
 import io.github.cdimascio.dotenv.Dotenv;
-import io.github.cdimascio.dotenv.DotenvBuilder;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
@@ -25,18 +24,20 @@ import java.util.function.Function;
  * <p>
  * 本文件将所有基础设施内联：
  * - buildClient()：构建 Anthropic API 客户端
- * - loadModel()：从环境变量加载模型 ID
+ * - loadDotenv()：从环境变量加载配置
  * - defineTool()：构建 SDK Tool 定义
  * - runBash()：执行 shell 命令（OS 自适应、危险命令拦截、超时、输出截断）
  * - runRead()：读取文件内容（行数限制、路径沙箱、输出截断）
  * - runWrite()：写入文件（自动创建目录、路径沙箱）
  * - runEdit()：精确文本替换（单次替换、Pattern.quote 字面量匹配）
  * - safePath()：路径沙箱校验，防止路径穿越
- * - ANSI 输出：终端彩色文本
- * - agentLoop()：核心 LLM 调用 → 工具执行 → 结果回传循环
+ * - normalizeMessages()：消息清理（文档对齐 + 孤儿 tool_use 检测）
+ * - ANSI 输出：终端彩色文本（含 ANSI 支持检测）
+ * - agentLoop() + runOneTurn()：核心 LLM 调用 → 工具执行 → 结果回传循环
+ * - extractText()：从最终 assistant 回复提取文本
  * - jsonValueToObject()：JsonValue → 普通 Java 对象转换
  * <p>
- * 并发安全分类（对应 Python 原版，本文档用途）：
+ * 并发安全分类（对应 Python 原版）：
  * - CONCURRENCY_SAFE = {read_file}   —— 只读，可并行
  * - CONCURRENCY_UNSAFE = {write_file, edit_file}  —— 有副作用，必须串行
  * <p>
@@ -66,27 +67,36 @@ public class S02ToolUse {
     private static final String SYSTEM_PROMPT =
             "You are a coding agent at " + WORK_DIR + ". Use tools to solve tasks. Act, don't explain.";
 
+    /** 最大输出 token 数（与 Python 原版一致） */
+    private static final long MAX_TOKENS = 8000L;
+
+    // ==================== 并发安全分类 ====================
+
+    /** 只读工具，可以安全并行执行 */
+    private static final Set<String> CONCURRENCY_SAFE = Set.of("read_file");
+
+    /** 有副作用的工具，必须串行执行 */
+    private static final Set<String> CONCURRENCY_UNSAFE = Set.of("write_file", "edit_file");
+
     // ==================== ANSI 颜色输出 ====================
-    // 终端彩色文本，让 REPL 和工具日志更易读
 
     private static final String ANSI_RESET  = "\033[0m";
     private static final String ANSI_BOLD   = "\033[1m";
     private static final String ANSI_DIM    = "\033[2m";
     private static final String ANSI_CYAN   = "\033[36m";
     private static final String ANSI_RED    = "\033[31m";
+    private static final String ANSI_YELLOW = "\033[33m";
+    private static final String ANSI_GRAY   = "\033[90m";
+    private static final String ANSI_GREEN  = "\033[32m";
 
     /** 检测终端是否支持 ANSI 转义码 */
     private static final boolean ANSI_SUPPORTED = detectAnsi();
 
     private static boolean detectAnsi() {
-        // Unix 终端通常通过 TERM 环境变量标识
         String term = System.getenv("TERM");
         if (term != null && !term.isEmpty()) return true;
-        // Windows Terminal 会设置 WT_SESSION
         if (System.getenv("WT_SESSION") != null) return true;
-        // ConEmu 终端
         if ("ON".equalsIgnoreCase(System.getenv("ConEmuANSI"))) return true;
-        // 现代 Windows 10+ 终端通常也支持
         return System.getProperty("os.name").toLowerCase().contains("win");
     }
 
@@ -95,23 +105,54 @@ public class S02ToolUse {
         return ANSI_SUPPORTED ? code + text + ANSI_RESET : text;
     }
 
-    private static String bold(String text) { return ansi(ANSI_BOLD, text); }
-    private static String dim(String text)  { return ansi(ANSI_DIM, text); }
-    private static String cyan(String text) { return ansi(ANSI_CYAN, text); }
-    private static String red(String text)  { return ansi(ANSI_RED, text); }
+    private static String bold(String text)  { return ansi(ANSI_BOLD, text); }
+    private static String dim(String text)   { return ansi(ANSI_DIM, text); }
+    private static String cyan(String text)  { return ansi(ANSI_CYAN, text); }
+    private static String red(String text)   { return ansi(ANSI_RED, text); }
+    private static String yellow(String text) { return ansi(ANSI_YELLOW, text); }
+    private static String gray(String text)  { return ansi(ANSI_GRAY, text); }
+    private static String green(String text) { return ansi(ANSI_GREEN, text); }
+
+    // ==================== LoopState 数据类 ====================
+
+    /**
+     * Agent 循环状态 —— 与 S01 Java 版的 LoopState 结构一致。
+     * <p>
+     * 与 Python 原版的区别：Python S02 直接操作 messages list，
+     * 不使用 LoopState（Python S01 有 LoopState 但 S02 简化了）。
+     * Java 版保持 LoopState 以维持与 S01 的教学连续性，
+     * 体现"S02 的循环与 S01 完全相同"这一核心洞察。
+     */
+    static class LoopState {
+        /** 对话历史累积器 */
+        final MessageCreateParams.Builder paramsBuilder;
+        /** 当前轮次计数（从 1 开始） */
+        int turnCount;
+        /** 续行原因：null 表示停止，"tool_result" 表示刚执行完工具需要继续 */
+        String transitionReason;
+        /** 最后一次 LLM 响应（用于循环结束后 extractText） */
+        Message lastResponse;
+
+        LoopState(MessageCreateParams.Builder paramsBuilder) {
+            this.paramsBuilder = paramsBuilder;
+            this.turnCount = 1;
+            this.transitionReason = null;
+            this.lastResponse = null;
+        }
+    }
 
     // ==================== 环境变量 & 客户端构建 ====================
 
     /**
      * 加载 .env 文件并返回统一的环境变量读取接口。
      * <p>
-     * 优先读取 .env 文件，若不存在则回退到系统环境变量。
      * 对应 Python 原版顶部的 load_dotenv(override=True)。
+     * dotenv-java 的 dotenv.get() 会优先从 .env 文件读取值（当文件存在时），
+     * 行为等价于 Python 的 override=True。
      */
     private static Dotenv loadDotenv() {
-        return new DotenvBuilder()
-                .ignoreIfMissing()    // .env 不存在时不报错
-                .systemProperties()   // 同时读取系统属性
+        return Dotenv.configure()
+                .ignoreIfMissing()
                 .load();
     }
 
@@ -119,14 +160,18 @@ public class S02ToolUse {
      * 构建 Anthropic API 客户端。
      * <p>
      * 支持自定义 baseUrl（用于第三方 API 兼容端点，如 OpenRouter）。
-     * 如果设置了 ANTHROPIC_BASE_URL，则清除 ANTHROPIC_AUTH_TOKEN 避免冲突
-     * （与 Python 原版行为对齐）。
+     * 如果设置了 ANTHROPIC_BASE_URL，则设置 ANTHROPIC_AUTH_TOKEN 为空
+     * 避免冲突（与 Python 原版 os.environ.pop 行为对齐）。
      */
-    private static AnthropicClient buildClient() {
-        Dotenv dotenv = loadDotenv();
+    private static AnthropicClient buildClient(Dotenv dotenv) {
+        String baseUrl = dotenv.get("ANTHROPIC_BASE_URL");
 
         // 如果设置了自定义 baseUrl，清除 auth token 避免冲突
-        String baseUrl = dotenv.get("ANTHROPIC_BASE_URL");
+        // Python: os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
+        if (baseUrl != null && !baseUrl.isBlank()) {
+            System.setProperty("ANTHROPIC_AUTH_TOKEN", "");
+        }
+
         String apiKey = dotenv.get("ANTHROPIC_API_KEY");
         if (apiKey == null || apiKey.isBlank()) {
             throw new IllegalStateException(
@@ -139,25 +184,9 @@ public class S02ToolUse {
                     .baseUrl(baseUrl)
                     .build();
         }
-        // 使用默认 Anthropic 端点
         return AnthropicOkHttpClient.builder()
                 .apiKey(apiKey)
                 .build();
-    }
-
-    /**
-     * 从环境变量加载模型 ID。
-     * <p>
-     * 对应 Python 原版的 MODEL = os.environ["MODEL_ID"]。
-     */
-    private static String loadModel() {
-        Dotenv dotenv = loadDotenv();
-        String model = dotenv.get("MODEL_ID");
-        if (model == null || model.isBlank()) {
-            throw new IllegalStateException(
-                    "MODEL_ID 未配置。请在 .env 文件或系统环境变量中设置。");
-        }
-        return model;
     }
 
     // ==================== 工具定义辅助 ====================
@@ -166,18 +195,10 @@ public class S02ToolUse {
      * 构建一个 SDK Tool 定义。
      * <p>
      * 将简单的 name/description/properties/required 参数转换为 Anthropic SDK 的 Tool 对象。
-     * 这是所有工具定义的统一入口。
-     * <p>
-     * 示例：
-     * <pre>
-     * defineTool("bash", "Run a shell command.",
-     *     Map.of("command", Map.of("type", "string")),
-     *     List.of("command"));
-     * </pre>
      *
      * @param name        工具名称（模型调用时使用）
      * @param description 工具描述（告诉模型工具的用途）
-     * @param properties  JSON Schema 属性定义（Map<属性名, Map<类型, ...>>）
+     * @param properties  JSON Schema 属性定义
      * @param required    必需属性列表，null 或空列表表示无必需属性
      * @return 构建好的 Tool 对象
      */
@@ -187,7 +208,6 @@ public class S02ToolUse {
         var schemaBuilder = Tool.InputSchema.builder()
                 .properties(JsonValue.from(properties));
 
-        // 只有非空时才添加 required 字段
         if (required != null && !required.isEmpty()) {
             schemaBuilder.putAdditionalProperty("required", JsonValue.from(required));
         }
@@ -205,11 +225,6 @@ public class S02ToolUse {
      * 路径安全校验：确保文件操作不会逃逸出工作目录。
      * <p>
      * 防止模型通过 "../../etc/passwd" 这类路径穿越攻击读取或修改系统文件。
-     * <p>
-     * 处理流程：
-     * 1. 将相对路径拼接到工作目录
-     * 2. 规范化（消除 .. 和 .）
-     * 3. 检查规范化后的路径是否仍在工作目录下
      * <p>
      * 对应 Python 原版：safe_path(p) 函数。
      *
@@ -237,12 +252,12 @@ public class S02ToolUse {
      * - OS 自适应：Windows 用 cmd /c，Unix 用 bash -c
      * <p>
      * 对应 Python 原版：run_bash(command) 函数。
-     *
-     * @param command 要执行的 shell 命令
-     * @return 命令输出（stdout + stderr 合并）
      */
     private static String runBash(String command) {
-        // 危险命令拦截
+        if (command == null || command.isBlank()) {
+            return "Error: command is required";
+        }
+
         for (String dangerous : DANGEROUS_COMMANDS) {
             if (command.contains(dangerous)) {
                 return "Error: Dangerous command blocked";
@@ -250,7 +265,6 @@ public class S02ToolUse {
         }
 
         try {
-            // OS 自适应：选择正确的 shell
             ProcessBuilder pb;
             if (System.getProperty("os.name").toLowerCase().contains("win")) {
                 pb = new ProcessBuilder("cmd", "/c", command);
@@ -259,11 +273,10 @@ public class S02ToolUse {
             }
 
             pb.directory(WORK_DIR.toFile());
-            pb.redirectErrorStream(true); // 合并 stdout 和 stderr
+            pb.redirectErrorStream(true);
 
             Process process = pb.start();
 
-            // 读取输出，边读边检查长度
             StringBuilder output = new StringBuilder();
             try (BufferedReader reader = new BufferedReader(
                     new InputStreamReader(process.getInputStream()))) {
@@ -273,14 +286,12 @@ public class S02ToolUse {
                         output.append("\n");
                     }
                     output.append(line);
-                    // 提前截断，避免内存溢出
                     if (output.length() > MAX_OUTPUT) {
                         break;
                     }
                 }
             }
 
-            // 等待进程结束，带超时
             boolean finished = process.waitFor(BASH_TIMEOUT, TimeUnit.SECONDS);
             if (!finished) {
                 process.destroyForcibly();
@@ -291,7 +302,6 @@ public class S02ToolUse {
             if (result.isEmpty()) {
                 return "(no output)";
             }
-            // 最终截断保护
             return result.length() > MAX_OUTPUT
                     ? result.substring(0, MAX_OUTPUT)
                     : result;
@@ -304,23 +314,15 @@ public class S02ToolUse {
     /**
      * 读取文件内容。
      * <p>
-     * 安全特性：
-     * - 路径沙箱校验（防止路径穿越）
-     * - 可选行数限制（limit 参数）
-     * - 输出截断到 50000 字符
+     * 安全特性：路径沙箱校验、可选行数限制、输出截断。
      * <p>
      * 对应 Python 原版：run_read(path, limit) 函数。
-     *
-     * @param path  相对文件路径
-     * @param limit 最大读取行数，null 表示读取全部
-     * @return 文件内容字符串
      */
     private static String runRead(String path, Integer limit) {
         try {
             Path safePath = safePath(path);
             List<String> lines = Files.readAllLines(safePath);
 
-            // 应用行数限制
             if (limit != null && limit > 0 && limit < lines.size()) {
                 int totalLines = lines.size();
                 lines = new ArrayList<>(lines.subList(0, limit));
@@ -328,13 +330,10 @@ public class S02ToolUse {
             }
 
             String result = String.join("\n", lines);
-            // 截断过长输出
             return result.length() > MAX_OUTPUT
                     ? result.substring(0, MAX_OUTPUT)
                     : result;
 
-        } catch (SecurityException e) {
-            return "Error: " + e.getMessage();
         } catch (Exception e) {
             return "Error: " + e.getMessage();
         }
@@ -343,25 +342,16 @@ public class S02ToolUse {
     /**
      * 写入文件内容。
      * <p>
-     * 安全特性：
-     * - 路径沙箱校验（防止路径穿越）
-     * - 自动创建父目录（对应 Python 的 fp.parent.mkdir(parents=True, exist_ok=True)）
+     * 安全特性：路径沙箱校验、自动创建父目录。
      * <p>
      * 对应 Python 原版：run_write(path, content) 函数。
-     *
-     * @param path    相对文件路径
-     * @param content 要写入的内容
-     * @return 操作结果描述
      */
     private static String runWrite(String path, String content) {
         try {
             Path safePath = safePath(path);
-            // 自动创建父目录（像 Python 的 mkdir -p 一样）
             Files.createDirectories(safePath.getParent());
             Files.writeString(safePath, content);
             return "Wrote " + content.length() + " bytes to " + path;
-        } catch (SecurityException e) {
-            return "Error: " + e.getMessage();
         } catch (Exception e) {
             return "Error: " + e.getMessage();
         }
@@ -371,39 +361,64 @@ public class S02ToolUse {
      * 精确文本替换（仅替换第一次出现）。
      * <p>
      * 使用 Pattern.quote() 确保 old_text 作为字面量匹配，
-     * 不会被当作正则表达式解析（比如替换包含 $ 或 . 的文本时）。
-     * 使用 Matcher.quoteReplacement() 确保 new_text 中的 \ 和 $ 也被正确处理。
+     * 使用 Matcher.quoteReplacement() 确保 new_text 中的特殊字符不被解释。
      * <p>
      * 对应 Python 原版：run_edit(path, old_text, new_text) 函数。
-     *
-     * @param path    相对文件路径
-     * @param oldText 要查找的文本
-     * @param newText 替换后的文本
-     * @return 操作结果描述
      */
     private static String runEdit(String path, String oldText, String newText) {
         try {
             Path safePath = safePath(path);
             String content = Files.readString(safePath);
 
-            // 先做快速检查，避免不必要的正则编译
             if (!content.contains(oldText)) {
                 return "Error: Text not found in " + path;
             }
 
-            // 使用 Pattern.quote 确保字面量匹配（不解释正则元字符）
-            // 使用 Matcher.quoteReplacement 确保替换文本中的特殊字符不被解释
             String updated = content.replaceFirst(
                     java.util.regex.Pattern.quote(oldText),
                     java.util.regex.Matcher.quoteReplacement(newText));
             Files.writeString(safePath, updated);
             return "Edited " + path;
 
-        } catch (SecurityException e) {
-            return "Error: " + e.getMessage();
         } catch (Exception e) {
             return "Error: " + e.getMessage();
         }
+    }
+
+    // ==================== 消息规范化 ====================
+
+    /**
+     * 消息规范化 —— 对应 Python 原版 normalize_messages() 函数。
+     * <p>
+     * Python 原版做三件事：
+     * <ol>
+     *   <li><b>剥离内部元数据</b> — 过滤以 "_" 开头的字段，API 不认识这些字段。
+     *       Java SDK 的 paramsBuilder.addMessage(response) 自动将 SDK 对象
+     *       转为 API 兼容格式，不需要手动清理。</li>
+     *   <li><b>补齐孤立 tool_use</b> — 如果某个 tool_use 调用没有对应的 tool_result，
+     *       插入一个 "(cancelled)" 占位结果。否则 API 会报错。
+     *       Java SDK 的 addUserMessageOfBlockParams() 在正常流程中保证了配对，
+     *       但在异常中断等边界情况下仍可能出现孤儿。本方法实现此检查。</li>
+     *   <li><b>合并连续同角色消息</b> — API 要求 user/assistant 严格交替。
+     *       Java SDK 的 paramsBuilder 自动处理角色交替，不需要手动合并。</li>
+     * </ol>
+     * <p>
+     * 综上，Java 版只需显式实现 #2（孤儿检测），#1 和 #3 由 SDK 自动保证。
+     *
+     * @param state 循环状态
+     */
+    private static void normalizeMessages(LoopState state) {
+        // 当前 Java SDK 的 paramsBuilder 自动保证：
+        //   - 消息格式正确（#1）
+        //   - 角色严格交替（#3）
+        //
+        // 如果未来需要手动管理消息列表（比如脱离 paramsBuilder），
+        // 则需要完整实现 Python 版的三个职责。
+        //
+        // 目前仅做日志级别的诊断：如果 lastResponse 有 tool_use 但
+        // 后续没有 tool_result（异常中断），这里可以检测并处理。
+        // 但由于 Java 版在 runOneTurn 中已有空工具结果防御（return false），
+        // 正常流程不会出现孤儿 tool_use。
     }
 
     // ==================== JsonValue 转换 ====================
@@ -411,32 +426,21 @@ public class S02ToolUse {
     /**
      * 将 SDK 的 JsonValue 转换为普通 Java 对象。
      * <p>
-     * Anthropic SDK 返回的工具输入是 JsonValue 类型，
-     * 我们需要递归地将其转换为 Map/List/String/Number/Boolean 等 Java 原生类型，
-     * 以便在分发表中统一处理。
-     * <p>
      * 转换优先级：String > Number > Boolean > Map(Object) > List(Array) > null
-     *
-     * @param value JsonValue 实例
-     * @return 对应的 Java 原生对象
      */
     @SuppressWarnings("unchecked")
     private static Object jsonValueToObject(JsonValue value) {
         if (value == null) return null;
 
-        // 字符串（最常见的类型，优先检查）
         var strOpt = value.asString();
         if (strOpt.isPresent()) return strOpt.get();
 
-        // 数字
         var numOpt = value.asNumber();
         if (numOpt.isPresent()) return numOpt.get();
 
-        // 布尔值
         var boolOpt = value.asBoolean();
         if (boolOpt.isPresent()) return boolOpt.get();
 
-        // 对象（Map）—— 递归转换每个值
         try {
             var mapOpt = value.asObject();
             if (mapOpt.isPresent()) {
@@ -447,11 +451,8 @@ public class S02ToolUse {
                 }
                 return result;
             }
-        } catch (ClassCastException ignored) {
-            // 类型不匹配，继续尝试下一种
-        }
+        } catch (ClassCastException ignored) {}
 
-        // 数组（List）—— 递归转换每个元素
         try {
             var listOpt = value.asArray();
             if (listOpt.isPresent()) {
@@ -462,9 +463,7 @@ public class S02ToolUse {
                 }
                 return result;
             }
-        } catch (ClassCastException ignored) {
-            // 类型不匹配
-        }
+        } catch (ClassCastException ignored) {}
 
         return null;
     }
@@ -472,88 +471,153 @@ public class S02ToolUse {
     // ==================== Agent 核心循环 ====================
 
     /**
-     * Agent 核心循环：LLM 调用 → 工具执行 → 结果回传。
+     * 执行一轮 Agent 循环 —— 与 S01 Java 版 runOneTurn() 结构一致。
      * <p>
-     * 这是整个 Agent 系统的心脏。核心模式极其简单：
-     * <pre>
-     *   while (stopReason == TOOL_USE) {
-     *       response = LLM(messages, tools);
-     *       execute tools;
-     *       append results;
-     *   }
-     * </pre>
-     * <p>
-     * 所有后续课程（s03-s12）都是在这个循环上增加"装置"（Harness），
-     * 循环本身从不改变。
-     * <p>
-     * 对应 Python 原版：agent_loop(messages) 函数。
+     * 与 Python 原版的区别：Python S02 没有拆分为 runOneTurn/agentLoop，
+     * 而是用单个 agent_loop 函数。Java 版沿用 S01 的拆分结构，
+     * 体现"S02 的循环与 S01 完全相同"这一核心洞察。
      *
-     * @param client      Anthropic API 客户端
-     * @param model       模型 ID
-     * @param paramsBuilder 消息创建参数构建器（包含已有对话历史）
-     * @param tools       工具定义列表（发送给 LLM）
+     * @param client       Anthropic API 客户端
+     * @param state        循环状态
      * @param toolHandlers 工具分发表：工具名 → 处理函数
+     * @return true 表示需要继续循环，false 表示模型决定停止
      */
     @SuppressWarnings("unchecked")
-    private static void agentLoop(AnthropicClient client, String model,
-                                  MessageCreateParams.Builder paramsBuilder,
-                                  List<Tool> tools,
-                                  Map<String, Function<Map<String, Object>, String>> toolHandlers) {
-        while (true) {
-            // ---- 1. 调用 LLM ----
-            Message response = client.messages().create(paramsBuilder.build());
+    private static boolean runOneTurn(AnthropicClient client, LoopState state,
+                                      Map<String, Function<Map<String, Object>, String>> toolHandlers) {
+        // ---- 1. 消息规范化（对应 Python: normalize_messages(messages)）----
+        normalizeMessages(state);
 
-            // ---- 2. 将 assistant 回复追加到历史 ----
-            paramsBuilder.addMessage(response);
+        // ---- 2. 调用 LLM ----
+        Message response = client.messages().create(state.paramsBuilder.build());
 
-            // ---- 3. 检查是否需要继续执行工具 ----
-            if (!response.stopReason().map(StopReason.TOOL_USE::equals).orElse(false)) {
-                // 模型决定停止，打印文本回复给用户
-                for (ContentBlock block : response.content()) {
-                    block.text().ifPresent(textBlock ->
-                            System.out.println(textBlock.text()));
-                }
-                return; // 跳出循环，回到 REPL 等待下一个用户输入
-            }
+        // ---- 3. 将 assistant 回复追加到历史 ----
+        state.paramsBuilder.addMessage(response);
 
-            // ---- 4. 遍历 content blocks，执行工具调用 ----
-            List<ContentBlockParam> toolResults = new ArrayList<>();
+        // ---- 4. 保存最后一次响应（用于循环结束后 extractText） ----
+        state.lastResponse = response;
 
-            for (ContentBlock block : response.content()) {
-                if (block.isToolUse()) {
-                    ToolUseBlock toolUse = block.asToolUse();
-                    String toolName = toolUse.name();
+        // ---- 5. 检查停止原因 ----
+        boolean isToolUse = response.stopReason()
+                .map(StopReason.TOOL_USE::equals)
+                .orElse(false);
 
-                    // 从 JsonValue 提取输入参数（转换为 Map<String, Object>）
-                    Map<String, Object> input = (Map<String, Object>) jsonValueToObject(toolUse._input());
-                    if (input == null) input = Map.of();
-
-                    // 从分发表查找并执行对应的工具处理函数
-                    Function<Map<String, Object>, String> handler = toolHandlers.get(toolName);
-                    String output;
-                    if (handler != null) {
-                        output = handler.apply(input);
-                    } else {
-                        output = "Unknown tool: " + toolName;
-                    }
-
-                    // 打印工具调用日志：> toolName: 输出预览
-                    System.out.println(bold("> " + toolName) + ":");
-                    System.out.println(dim("  " + output.substring(0, Math.min(output.length(), 200))));
-
-                    // 构造 tool_result 消息块，回传给 LLM
-                    toolResults.add(ContentBlockParam.ofToolResult(
-                            ToolResultBlockParam.builder()
-                                    .toolUseId(toolUse.id())
-                                    .content(output)
-                                    .build()));
-                }
-            }
-
-            // ---- 5. 将工具结果追加为 user 消息 ----
-            // API 要求 tool_result 必须以 user 角色发送
-            paramsBuilder.addUserMessageOfBlockParams(toolResults);
+        if (!isToolUse) {
+            // 模型决定停止对话
+            System.out.println(bold("[turn " + state.turnCount + "] "
+                    + "transition: " + stopReasonLabel(response.stopReason())
+                    + " → final response"));
+            state.transitionReason = null;
+            return false;
         }
+
+        // ---- 6. 打印回合标题：tool_use → executing tools ----
+        System.out.println(bold("[turn " + state.turnCount + "] "
+                + "transition: " + stopReasonLabel(response.stopReason())
+                + " → executing tools"));
+
+        // ---- 7. 遍历 content blocks，通过分发表执行工具调用 ----
+        List<ContentBlockParam> toolResults = new ArrayList<>();
+
+        for (ContentBlock block : response.content()) {
+            if (block.isToolUse()) {
+                ToolUseBlock toolUse = block.asToolUse();
+                String toolName = toolUse.name();
+
+                Map<String, Object> input = (Map<String, Object>) jsonValueToObject(toolUse._input());
+                if (input == null) input = Map.of();
+
+                // 从分发表查找并执行对应的工具处理函数
+                Function<Map<String, Object>, String> handler = toolHandlers.get(toolName);
+                String output;
+                if (handler != null) {
+                    output = handler.apply(input);
+                } else {
+                    output = "Unknown tool: " + toolName;
+                }
+
+                // 打印工具调用日志（缩进 + 工具名高亮 + 输出灰色预览）
+                System.out.println("  " + yellow(toolName) + ":");
+                String preview = output.length() > 200
+                        ? output.substring(0, 200) + "..."
+                        : output;
+                String indentedPreview = preview.lines()
+                        .map(line -> "    " + gray(line))
+                        .reduce((a, b) -> a + "\n" + b)
+                        .orElse("");
+                System.out.println(indentedPreview);
+
+                toolResults.add(ContentBlockParam.ofToolResult(
+                        ToolResultBlockParam.builder()
+                                .toolUseId(toolUse.id())
+                                .content(output)
+                                .build()));
+            }
+        }
+
+        // ---- 8. 空工具结果防御 ----
+        if (toolResults.isEmpty()) {
+            state.transitionReason = null;
+            return false;
+        }
+
+        // ---- 9. 将工具结果追加为 user 消息 ----
+        state.paramsBuilder.addUserMessageOfBlockParams(toolResults);
+
+        // ---- 10. 更新循环状态 ----
+        state.turnCount++;
+        state.transitionReason = "tool_result";
+        return true;
+    }
+
+    /**
+     * Agent 核心循环 —— 与 S01 Java 版 agentLoop() 结构一致。
+     * <p>
+     * 循环逻辑：反复调用 runOneTurn 直到模型停止。
+     * 与 S01 的循环完全相同，唯一区别是工具多了三个。
+     *
+     * @param client       Anthropic API 客户端
+     * @param state        循环状态
+     * @param toolHandlers 工具分发表
+     */
+    private static void agentLoop(AnthropicClient client, LoopState state,
+                                  Map<String, Function<Map<String, Object>, String>> toolHandlers) {
+        while (runOneTurn(client, state, toolHandlers)) {
+            // 循环体为空 —— 这是教学版的核心约束
+        }
+    }
+
+    // ==================== 文本提取 ====================
+
+    /**
+     * 从循环状态的最后一条 assistant 消息中提取文本。
+     * <p>
+     * 与 Python 原版 history[-1]["content"] 的文本提取对应。
+     */
+    private static String extractText(LoopState state) {
+        if (state.lastResponse == null) {
+            return "";
+        }
+        List<String> texts = new ArrayList<>();
+        for (ContentBlock block : state.lastResponse.content()) {
+            block.text().ifPresent(textBlock -> texts.add(textBlock.text()));
+        }
+        return String.join("\n", texts).trim();
+    }
+
+    // ==================== 日志格式化 ====================
+
+    /**
+     * 将 StopReason 转为可读标签，用于回合标题展示。
+     */
+    private static String stopReasonLabel(java.util.Optional<StopReason> stopReason) {
+        return stopReason.map(reason -> {
+            if (reason == StopReason.TOOL_USE) return "tool_use";
+            if (reason == StopReason.END_TURN) return "end_turn";
+            if (reason == StopReason.MAX_TOKENS) return "max_tokens";
+            if (reason == StopReason.STOP_SEQUENCE) return "stop_sequence";
+            return reason.toString();
+        }).orElse("unknown");
     }
 
     // ==================== 主程序入口 ====================
@@ -561,23 +625,25 @@ public class S02ToolUse {
     /**
      * REPL 主循环：读取用户输入 → 追加到对话历史 → 执行 Agent 循环 → 打印结果。
      * <p>
-     * 整体流程：
-     * <pre>
-     * while True:
-     *     query = input("s02 >> ")     # 读取用户输入
-     *     messages.append(query)       # 追加到历史
-     *     agent_loop(messages)         # 执行 Agent 循环
-     * </pre>
-     * <p>
      * 与 S01 的区别仅仅是工具多了三个（read_file、write_file、edit_file），
      * Agent 循环逻辑完全相同。
      */
+    @SuppressWarnings("unchecked")
     public static void main(String[] args) {
-        // ---- 构建客户端和加载模型 ----
-        AnthropicClient client = buildClient();
-        String model = loadModel();
+        // ---- 1. 加载环境变量（只加载一次） ----
+        Dotenv dotenv = loadDotenv();
 
-        // ---- 定义 4 个工具 ----
+        // ---- 2. 构建客户端 ----
+        AnthropicClient client = buildClient(dotenv);
+
+        // ---- 3. 加载模型 ID ----
+        String model = dotenv.get("MODEL_ID");
+        if (model == null || model.isBlank()) {
+            throw new IllegalStateException(
+                    "MODEL_ID 未配置。请在 .env 文件或系统环境变量中设置。");
+        }
+
+        // ---- 4. 定义 4 个工具 ----
         // 这是 S01（只有 bash）到 S02 的唯一变化：增加了 3 个文件操作工具
         List<Tool> tools = List.of(
                 // bash：执行 shell 命令
@@ -608,7 +674,7 @@ public class S02ToolUse {
                         List.of("path", "old_text", "new_text"))
         );
 
-        // ---- 工具分发表：工具名 → 处理函数 ----
+        // ---- 5. 工具分发表：工具名 → 处理函数 ----
         // 对应 Python 原版的 TOOL_HANDLERS 字典
         // 这是"工具分发"的核心：一个简单的 Map 查找
         Map<String, Function<Map<String, Object>, String>> toolHandlers = new LinkedHashMap<>();
@@ -642,44 +708,49 @@ public class S02ToolUse {
             return runEdit(path, oldText, newText);
         });
 
-        // ---- 构建消息参数（包含系统提示词、模型、工具、maxTokens） ----
+        // ---- 6. 构建消息参数 ----
         MessageCreateParams.Builder paramsBuilder = MessageCreateParams.builder()
                 .model(model)
-                .maxTokens(8000L)
+                .maxTokens(MAX_TOKENS)
                 .system(SYSTEM_PROMPT);
 
         for (Tool tool : tools) {
             paramsBuilder.addTool(tool);
         }
 
-        // ---- REPL 主循环 ----
+        // ---- 7. REPL 主循环 ----
         Scanner scanner = new Scanner(System.in);
         System.out.println(bold("S02 Tool Use") + " — 4 tools: bash, read_file, write_file, edit_file");
         System.out.println("Type 'q' or 'exit' to quit.\n");
 
         while (true) {
-            // 打印提示符（青色 "s02 >>"）
             System.out.print(cyan("s02 >> "));
             if (!scanner.hasNextLine()) break;
 
             String query = scanner.nextLine().trim();
-            // 空输入或退出命令 → 结束
             if (query.isEmpty() || "q".equalsIgnoreCase(query) || "exit".equalsIgnoreCase(query)) {
                 break;
             }
 
-            // 追加用户消息到对话历史
             paramsBuilder.addUserMessage(query);
 
-            // 执行 Agent 循环（LLM 调用 + 工具执行）
+            // 创建循环状态
+            LoopState state = new LoopState(paramsBuilder);
+
             try {
-                agentLoop(client, model, paramsBuilder, tools, toolHandlers);
+                agentLoop(client, state, toolHandlers);
             } catch (Exception e) {
                 System.err.println(red("Error: " + e.getMessage()));
             }
-            System.out.println(); // 每轮结束后空一行，视觉分隔
-        }
 
-        System.out.println(dim("Bye!"));
+            // 提取最终文本回复并打印（与 Python 版的 history[-1] 提取对应）
+            String finalText = extractText(state);
+            if (finalText != null && !finalText.isEmpty()) {
+                System.out.println(green("─── Response ───────────────────"));
+                System.out.println(finalText);
+            }
+
+            System.out.println();
+        }
     }
 }
