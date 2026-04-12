@@ -536,8 +536,9 @@ public class S02ToolUse {
                     output = "Unknown tool: " + toolName;
                 }
 
-                // 打印工具调用日志（缩进 + 工具名高亮 + 输出灰色预览）
-                System.out.println("  " + yellow(toolName) + ":");
+                // 打印工具调用日志（缩进 + 工具名高亮 + 入参摘要 + 输出灰色预览）
+                String inputSummary = formatInputSummary(toolName, input);
+                System.out.println("  " + yellow(toolName) + "(" + dim(inputSummary) + ")");
                 String preview = output.length() > 200
                         ? output.substring(0, 200) + "..."
                         : output;
@@ -618,6 +619,69 @@ public class S02ToolUse {
             if (reason == StopReason.STOP_SEQUENCE) return "stop_sequence";
             return reason.toString();
         }).orElse("unknown");
+    }
+
+    /**
+     * 格式化工具入参摘要 —— 根据工具类型展示最关键的参数。
+     * <p>
+     * 不同工具的摘要策略：
+     * <ul>
+     *   <li>bash — 直接展示 command 值（等价于 S01 的 $ command）</li>
+     *   <li>read_file — 展示 path，可选展示 limit</li>
+     *   <li>write_file — 展示 path，content 只显示前 50 字符 + 长度</li>
+     *   <li>edit_file — 展示 path，old_text 只显示前 50 字符</li>
+     * </ul>
+     *
+     * @param toolName 工具名称
+     * @param input    工具输入参数
+     * @return 格式化的入参摘要字符串
+     */
+    private static String formatInputSummary(String toolName, Map<String, Object> input) {
+        if (input == null || input.isEmpty()) return "";
+
+        switch (toolName) {
+            case "bash": {
+                // bash: 直接展示完整命令
+                String command = String.valueOf(input.get("command"));
+                return command;
+            }
+            case "read_file": {
+                // read_file: path=xxx, limit=N (可选)
+                String path = String.valueOf(input.get("path"));
+                Object limit = input.get("limit");
+                return limit != null ? path + ", limit=" + limit : path;
+            }
+            case "write_file": {
+                // write_file: path=xxx, content=<前50字符>... (N bytes)
+                String path = String.valueOf(input.get("path"));
+                String content = String.valueOf(input.get("content"));
+                if (content.length() > 50) {
+                    return path + ", content=\"" + content.substring(0, 50) + "...\" (" + content.length() + " chars)";
+                }
+                return path + ", content=\"" + content + "\"";
+            }
+            case "edit_file": {
+                // edit_file: path=xxx, "old" → "new" (各截断到 40 字符)
+                String path = String.valueOf(input.get("path"));
+                String oldText = String.valueOf(input.get("old_text"));
+                String newText = String.valueOf(input.get("new_text"));
+                String oldSnippet = oldText.length() > 40 ? oldText.substring(0, 40) + "..." : oldText;
+                String newSnippet = newText.length() > 40 ? newText.substring(0, 40) + "..." : newText;
+                return path + ", \"" + oldSnippet + "\" → \"" + newSnippet + "\"";
+            }
+            default: {
+                // 未知工具：展示所有 key=value
+                return input.entrySet().stream()
+                        .map(e -> e.getKey() + "=" + truncate(String.valueOf(e.getValue()), 60))
+                        .reduce((a, b) -> a + ", " + b)
+                        .orElse("");
+            }
+        }
+    }
+
+    /** 截断字符串到指定长度 */
+    private static String truncate(String s, int maxLen) {
+        return s.length() > maxLen ? s.substring(0, maxLen) + "..." : s;
     }
 
     // ==================== 主程序入口 ====================
