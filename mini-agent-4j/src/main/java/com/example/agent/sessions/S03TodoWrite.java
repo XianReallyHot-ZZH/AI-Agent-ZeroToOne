@@ -614,7 +614,7 @@ public class S03TodoWrite {
             String reminder = todo.reminder();
             if (reminder != null) {
                 // 在结果列表最前面插入提醒文本块
-                toolResults.add(0, ContentBlockParam.ofText(
+                toolResults.addFirst(ContentBlockParam.ofText(
                         TextBlockParam.builder()
                                 .text(reminder)
                                 .build()));

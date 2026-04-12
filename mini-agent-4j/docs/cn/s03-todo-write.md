@@ -390,6 +390,70 @@ planning state    -> 当前计划的显式外部状态
 
 **当计划进入结构化状态，而不是散在自然语言里时，agent 的漂移会明显减少。**
 
+## 试一试
+
+```sh
+cd mini-agent-4j
+mvn compile exec:java -Dexec.mainClass="com.example.agent.sessions.S03TodoWrite"
+```
+
+### 案例 1：多文件创建（基础规划）
+
+> 让模型用 todo 拆分一个多步文件创建任务，观察计划如何随步骤推进更新。
+
+```
+在当前目录创建一个 calc 项目：calc/Add.java 实现加法，calc/Sub.java 实现减法，calc/Main.java 调用前两个类并打印 3+2 和 3-2 的结果，然后编译运行验证结果
+```
+
+观察要点：
+- 模型是否在开始时创建 todo 列表（3-4 项）
+- 每完成一步是否把 pending → completed，下一步 → in_progress
+- 日志中 `todo(3 items, in_progress: "...")` 的变化
+
+### 案例 2：代码审查 + 修复（读-分析-改循环）
+
+> 让模型先阅读代码、定位问题、再修复，体验"先规划后执行"的节奏。
+
+先准备一个有 bug 的文件：
+```
+创建 bug_demo.java，内容为：public class bug_demo { public static void main(String[] args) { int x = 10 / 0; System.out.println(x); } }
+```
+
+然后让它修复：
+```
+阅读 bug_demo.java，找出运行时会出错的地方，修复它，然后编译运行验证修复成功
+```
+
+观察要点：
+- 模型是否先用 todo 规划"阅读 → 定位 → 修复 → 验证"的步骤
+- 计划是否在每步完成后更新
+
+### 案例 3：重构任务（多步编辑 + Nag Reminder 触发）
+
+> 一个足够长的任务，可能触发 Nag Reminder（连续 3 轮未更新 todo 时的催促）。
+
+```
+在当前目录创建一个 shapes.txt 文件，里面写 5 个形状的名称和面积公式（圆形、矩形、三角形、梯形、椭圆），每行一个。然后创建一个 Java 程序 ShapeCalculator.java，为每个形状写一个计算面积的方法，在 main 方法中用具体数值测试所有形状，编译运行并展示结果
+```
+
+观察要点：
+- 这是一个 5+ 步骤的任务，模型是否拆分成合理的计划
+- 如果模型中间连续执行工具而忘记更新 todo，是否看到 `<reminder>` 催促
+- 催促后模型是否会刷新计划
+
+### 案例 4：自由探索（对比有无 todo 的差异）
+
+> 不给具体指令，让模型自主规划一个复杂任务，验证 todo 的规划能力。
+
+```
+帮我搭建一个简单的 Java 单元测试框架，包含：一个 TestRunner 类（运行测试并报告结果），一个 @Test 注解，一个 AssertionError 类，以及一个使用示例 ExampleTest.java。最后运行示例验证一切工作正常
+```
+
+观察要点：
+- 模型如何将复杂需求拆解为 todo 项
+- activeForm 是否在 in_progress 项上显示（如 "Writing TestRunner"）
+- 最终 `(N/M completed)` 的进度是否准确
+
 ## 一句话记住
 
 **`s03` 的 todo，不是任务平台，而是当前会话里的"外显计划状态"。**
