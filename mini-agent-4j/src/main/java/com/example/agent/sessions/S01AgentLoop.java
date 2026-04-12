@@ -70,6 +70,12 @@ public class S01AgentLoop {
     private static final String ANSI_YELLOW = "\033[33m";
     /** ANSI 青色（用于 REPL 提示符） */
     private static final String ANSI_CYAN = "\033[36m";
+    /** ANSI 灰色（用于工具输出预览） */
+    private static final String ANSI_GRAY = "\033[90m";
+    /** ANSI 绿色（用于最终模型回复标题） */
+    private static final String ANSI_GREEN = "\033[32m";
+    /** ANSI 粗体（用于回合标题） */
+    private static final String ANSI_BOLD = "\033[1m";
 
     // ==================== LoopState 数据类 ====================
 
@@ -217,6 +223,8 @@ public class S01AgentLoop {
             // 提取最终文本回复并打印（与 Python 版的 extract_text(history[-1]) 对应）
             String finalText = extractText(state);
             if (finalText != null && !finalText.isEmpty()) {
+                // 最终模型回复用绿色分隔线标识，与工具输出明确区分
+                System.out.println(ANSI_GREEN + "─── Response ───────────────────" + ANSI_RESET);
                 System.out.println(finalText);
             }
 
@@ -270,14 +278,22 @@ public class S01AgentLoop {
 
         if (!isToolUse) {
             // 模型决定停止对话
+            System.out.println(ANSI_BOLD + "[turn " + state.turnCount + "] "
+                    + "transition: " + stopReasonLabel(response.stopReason())
+                    + " → final response" + ANSI_RESET);
             state.transitionReason = null;
             return false;
         }
 
-        // ---- 5. 遍历 content blocks，执行工具调用 ----
+        // ---- 5. 打印回合标题：tool_use → executing tools ----
+        System.out.println(ANSI_BOLD + "[turn " + state.turnCount + "] "
+                + "transition: " + stopReasonLabel(response.stopReason())
+                + " → executing tools" + ANSI_RESET);
+
+        // ---- 6. 遍历 content blocks，执行工具调用 ----
         List<ContentBlockParam> toolResults = executeToolCalls(response.content());
 
-        // ---- 6. 空工具结果防御 ----
+        // ---- 7. 空工具结果防御 ----
         // Python: if not results: return False
         // 理论上 tool_use 存在时 results 不会为空，但做防御性检查
         // 避免 API 报错（Anthropic 要求 tool_result 必须与 tool_use 配对）
@@ -286,11 +302,11 @@ public class S01AgentLoop {
             return false;
         }
 
-        // ---- 7. 将工具结果追加为 user 消息 ----
+        // ---- 8. 将工具结果追加为 user 消息 ----
         // Anthropic API 要求工具结果必须以 role=user 的消息发送
         state.paramsBuilder.addUserMessageOfBlockParams(toolResults);
 
-        // ---- 8. 更新循环状态 ----
+        // ---- 9. 更新循环状态 ----
         state.turnCount++;
         state.transitionReason = "tool_result";
         return true;
@@ -348,16 +364,22 @@ public class S01AgentLoop {
                         ? (String) input.get("command")
                         : "";
 
-                // 打印正在执行的命令（黄色高亮，与 Python 版一致）
-                System.out.println(ANSI_YELLOW + "$ " + command + ANSI_RESET);
+                // 打印正在执行的命令（缩进 + 黄色）
+                System.out.println("  " + ANSI_YELLOW + "$ " + command + ANSI_RESET);
 
                 // 执行 bash 命令
                 String output = runBash(command);
 
-                // 打印结果预览（前 200 字符）
-                System.out.println(output.length() > PREVIEW_LEN
-                        ? output.substring(0, PREVIEW_LEN)
-                        : output);
+                // 打印结果预览（缩进 + 灰色，前 200 字符）
+                String preview = output.length() > PREVIEW_LEN
+                        ? output.substring(0, PREVIEW_LEN) + "..."
+                        : output;
+                // 每行都缩进，保持对齐
+                String indentedPreview = preview.lines()
+                        .map(line -> "  " + ANSI_GRAY + line + ANSI_RESET)
+                        .reduce((a, b) -> a + "\n" + b)
+                        .orElse("");
+                System.out.println(indentedPreview);
 
                 // 构造 tool_result block，关联 tool_use_id
                 results.add(ContentBlockParam.ofToolResult(
@@ -396,6 +418,24 @@ public class S01AgentLoop {
             block.text().ifPresent(textBlock -> texts.add(textBlock.text()));
         }
         return String.join("\n", texts).trim();
+    }
+
+    // ==================== 基础设施：日志格式化 ====================
+
+    /**
+     * 将 StopReason 转为可读标签，用于回合标题展示。
+     *
+     * @param stopReason Optional 的 StopReason
+     * @return 可读的标签字符串
+     */
+    private static String stopReasonLabel(java.util.Optional<StopReason> stopReason) {
+        return stopReason.map(reason -> {
+            if (reason == StopReason.TOOL_USE) return "tool_use";
+            if (reason == StopReason.END_TURN) return "end_turn";
+            if (reason == StopReason.MAX_TOKENS) return "max_tokens";
+            if (reason == StopReason.STOP_SEQUENCE) return "stop_sequence";
+            return reason.toString();
+        }).orElse("unknown");
     }
 
     // ==================== 基础设施：客户端构建 ====================
