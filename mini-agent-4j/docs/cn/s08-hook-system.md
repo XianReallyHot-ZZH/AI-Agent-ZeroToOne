@@ -1,66 +1,158 @@
 # s08：Hook 系统
 
-`s01 > s02 > s03 > s04 > s05 > s06 | s07 > [ s08 ] s09 > s10 > s11 > s12 > s13 > s14 > s15 > s16 > s17 > s18 > s19`
+`s00 > s01 > s02 > s03 > s04 > s05 > s06 > s07 > [ s08 ] > s09 > s10 > s11 > s12 > s13 > s14 > s15 > s16 > s17 > s18 > s19`
 
-> *"不改循环，扩展 Agent。"* —— Hook 是主循环的扩展点，不改写循环本身即可注入行为。
+> *不改主循环代码，也能在关键时机插入额外行为。*
 
-## 课程目标
+## 建议联读
 
-理解如何通过 Hook 机制在不修改 Agent 核心循环的情况下，注入预处理和后处理逻辑。Hook 让 Agent 变成一个可插拔的平台。
+- 如果你还在把 hook 想成"往主循环里继续塞 if/else"，先回 [`s02a-tool-control-plane.md`](./s02a-tool-control-plane.md)，重新确认主循环和控制面的边界。
+- 如果你开始把主循环、tool handler、hook side effect 混成一层，建议先看 [`entity-map.md`](./entity-map.md)，把谁负责推进主状态、谁只是旁路观察分开。
+- 如果你准备继续读后面的 prompt、recovery、teams，可以把 [`s00e-reference-module-map.md`](./s00e-reference-module-map.md) 一起放在旁边，因为从这一章开始"控制面 + 侧车扩展"会反复一起出现。
 
-## 问题
+## 什么是 hook
 
-不同的团队和项目有不同的需求：代码审查、日志记录、安全策略、通知推送。如果把这些都硬编码进 Agent 循环，代码会膨胀到不可维护。我们需要一种机制让使用者在不改循环的情况下注入自定义行为。
+到了 `s07`，我们已经能在工具执行前做权限判断。
 
-## 方案
+但很多真实需求并不属于"允许 / 拒绝"这条线，而属于：
 
-Hook 是在特定事件点触发的子进程。它们在工具执行的前后运行，可以拦截、修改或追加信息：
+- 在某个固定时机顺手做一点事
+- 不改主循环主体，也能接入额外规则
+- 让用户或插件在系统边缘扩展能力
 
+例如：
+
+- 会话开始时打印欢迎信息
+- 工具执行前做一次额外检查
+- 工具执行后补一条审计日志
+
+如果每增加一个需求，你都去修改主循环，主循环就会越来越重，最后谁都不敢动。
+
+所以这一章要引入的机制是：
+
+**主循环只负责暴露"时机"，真正的附加行为交给 hook。**
+
+你可以把 `hook` 理解成一个"预留插口"。
+
+意思是：
+
+1. 主系统运行到某个固定时机
+2. 把当前上下文交给 hook
+3. hook 返回结果
+4. 主系统再决定下一步怎么继续
+
+最重要的一句话是：
+
+**hook 让系统可扩展，但不要求主循环理解每个扩展需求。**
+
+主循环只需要知道三件事：
+
+- 现在是什么事件
+- 要把哪些上下文交出去
+- 收到结果以后怎么处理
+
+## 最小心智模型
+
+教学版先只讲 3 个事件：
+
+- `SessionStart`
+- `PreToolUse`
+- `PostToolUse`
+
+这样做不是因为系统永远只有 3 个事件，
+而是因为初学者先把这 3 个事件学明白，就已经能自己做出一套可用的 hook 机制。
+
+可以把它想成这条流程：
+
+```text
+主循环继续往前跑
+  |
+  +-- 到了某个预留时机
+  |
+  +-- 调用 hook runner
+  |
+  +-- 收到 hook 返回结果
+  |
+  +-- 决定继续、阻止、还是补充说明
 ```
-                Agent 循环
-                    |
-          +---------+---------+
-          v                   v
-   [PreToolUse Hook]    [PostToolUse Hook]
-          |                   |
-    退出码 0 → 继续      退出码 0 → 继续
-    退出码 1 → 阻断      退出码 2 → 注入消息
-    退出码 2 → 注入消息   (可修改 tool_output)
-```
 
-退出码契约：
+## 教学版统一返回约定
 
-| 退出码 | 含义     | stdout               | stderr        |
-|--------|----------|----------------------|---------------|
-| 0      | 继续     | 可选 JSON（修改输入） | --            |
-| 1      | 阻断执行 | --                   | 阻断原因      |
-| 2      | 注入消息 | --                   | 要注入的文本  |
+这一章最容易把人讲乱的地方，就是"不同 hook 事件的返回语义"。
 
-## 核心概念
+教学版建议先统一成下面这套规则：
 
-### 三种 Hook 事件
+| 退出码 | 含义 | stdout | stderr |
+|---|---|---|---|
+| `0` | 正常继续 | 可选 JSON（修改输入、追加上下文） | -- |
+| `1` | 阻止当前动作 | -- | 阻断原因 |
+| `2` | 注入一条补充消息，再继续 | -- | 要注入的文本 |
 
-- **SessionStart**：会话启动时触发，用于初始化
-- **PreToolUse**：工具执行前触发，可拦截或修改工具输入
-- **PostToolUse**：工具执行后触发，可追加额外信息
+这套规则的价值不在于"最真实"，而在于"最容易学会"。
 
-### HookManager —— Hook 管理器
+因为它让你先记住 hook 最核心的 3 种作用：
 
-从 `.hooks.json` 加载 Hook 定义，根据事件类型和 matcher 筛选并执行：
+- 观察
+- 拦截
+- 补充
+
+等教学版跑通以后，再去做"不同事件采用不同语义"的细化，也不会乱。
+
+## 关键数据结构
+
+### 1. HookEvent
+
+Java 实现中，事件通过字符串常量和上下文 Map 传递：
 
 ```java
-static class HookManager {
-    HookResult runHooks(String event, Map<String, Object> context) {
-        // 1. 检查工作区信任（.claude/.claude_trusted）
-        // 2. 遍历匹配的 Hook（根据 matcher 过滤）
-        // 3. 构建环境变量（HOOK_EVENT, HOOK_TOOL_NAME, HOOK_TOOL_INPUT）
-        // 4. 执行子进程（30 秒超时）
-        // 5. 根据退出码解析结果
-    }
+// 事件类型常量
+private static final String EVENT_PRE_TOOL_USE  = "PreToolUse";
+private static final String EVENT_POST_TOOL_USE = "PostToolUse";
+private static final String EVENT_SESSION_START = "SessionStart";
+
+// 事件上下文（Map<String, Object>）
+Map<String, Object> hookContext = new LinkedHashMap<>();
+hookContext.put("tool_name", toolName);
+hookContext.put("tool_input", input);
+```
+
+它回答的是：
+
+- 现在发生了什么事
+- 这件事的上下文是什么
+
+### 2. HookResult
+
+```java
+static class HookResult {
+    boolean blocked = false;           // 是否被阻断
+    String blockReason = null;         // 阻断原因（来自 stderr）
+    List<String> messages = new ArrayList<>();  // 要注入的消息列表
+    String permissionOverride = null;  // 权限决策覆盖
 }
 ```
 
-### Hook 配置文件
+它回答的是：
+
+- hook 想不想阻止主流程
+- 要不要向模型补一条说明
+
+### 3. HookRunner（HookManager）
+
+```java
+static class HookManager {
+    HookResult runHooks(String event, Map<String, Object> context) { ... }
+}
+```
+
+主循环不直接关心"每个 hook 的细节实现"。
+它只把事件交给统一的 runner。
+
+这就是这一章的关键抽象边界：
+
+**主循环知道事件名，hook runner 知道怎么调扩展逻辑。**
+
+Java 实现中，`HookManager` 从 `.hooks.json` 加载 Hook 定义：
 
 ```json
 {
@@ -78,12 +170,6 @@ static class HookManager {
 }
 ```
 
-### 工作区信任
-
-Hook 只在受信任的工作区中运行。信任标记文件：`.claude/.claude_trusted`。
-
-### Hook 环境变量
-
 每次 Hook 执行时，Agent 通过环境变量传递上下文：
 
 ```java
@@ -93,49 +179,183 @@ env.put("HOOK_TOOL_INPUT", inputJson);    // 截断到 10000 字符
 env.put("HOOK_TOOL_OUTPUT", outputStr);   // 仅 PostToolUse
 ```
 
-## 关键代码片段
+## 最小执行流程
 
-Hook 感知的 Agent 循环，在工具执行前后调用 Hook：
+先看最重要的 `PreToolUse` / `PostToolUse`：
+
+```text
+model 发起 tool_use
+    |
+    v
+run_hook("PreToolUse", ...)
+    |
+    +-- exit 1 -> 阻止工具执行
+    +-- exit 2 -> 先补一条消息给模型，再继续
+    +-- exit 0 -> 直接继续（stdout 可修改工具输入）
+    |
+    v
+执行工具
+    |
+    v
+run_hook("PostToolUse", ...)
+    |
+    +-- exit 2 -> 追加补充说明
+    +-- exit 0 -> 正常结束
+```
+
+再加上 `SessionStart`，一整套最小 hook 机制就立住了。
+
+## 最小实现
+
+### 第一步：准备事件到处理器的映射
+
+Java 实现中，Hook 定义从配置文件加载，存储为 `Map<String, List<HookDefinition>>`：
+
+```java
+// Hook 定义结构
+static class HookDefinition {
+    final String matcher;   // 工具名过滤器（"*" 匹配所有，或指定工具名）
+    final String command;   // 要执行的 shell 命令
+}
+
+// Hook 注册表：事件类型 -> Hook 定义列表
+private final Map<String, List<HookDefinition>> hooks;
+```
+
+这里先用"一个事件对应一组处理函数"的最小结构就够了。
+
+### 第二步：统一运行 hook
+
+```java
+HookResult runHooks(String event, Map<String, Object> context) {
+    HookResult result = new HookResult();
+
+    // 信任门控：不受信任的工作区不执行 Hook
+    if (!checkWorkspaceTrust()) return result;
+
+    for (HookDefinition hookDef : hooks.getOrDefault(event, List.of())) {
+        // Matcher 过滤：检查当前工具是否匹配此 Hook
+        if (!"*".equals(matcher) && !matcher.equals(toolName)) continue;
+
+        // 执行子进程，解析退出码
+        int exitCode = process.exitValue();
+        if (exitCode == 1) {
+            result.blocked = true;
+            result.blockReason = stderrStr;
+            return result;     // 阻断，不再继续
+        }
+        if (exitCode == 2) {
+            result.messages.add(stderrStr);  // 注入消息
+        }
+    }
+    return result;
+}
+```
+
+教学版里先用"谁先返回阻止/注入，谁就优先"的简单规则。
+
+### 第三步：接进主循环
 
 ```java
 // PreToolUse Hook
 HookManager.HookResult preResult = hookManager.runHooks("PreToolUse", hookContext);
 
+// 注入 PreToolUse Hook 消息
+for (String msg : preResult.messages) {
+    toolResults.add(...);  // 消息回传给 LLM
+}
+
+// 如果被 Hook 阻断，跳过工具执行
 if (preResult.blocked) {
-    // 被阻断，跳过工具执行
-    output = "Tool blocked by PreToolUse hook: " + reason;
+    String output = "Tool blocked by PreToolUse hook: " + reason;
+    toolResults.add(...);  // 阻断消息回传给 LLM
     continue;
 }
 
-// 执行工具
+// 执行工具（如果 Hook 修改了 tool_input，使用更新后的值）
+Map<String, Object> effectiveInput =
+    (Map<String, Object>) hookContext.getOrDefault("tool_input", input);
 output = handler.apply(effectiveInput);
 
 // PostToolUse Hook
 hookContext.put("tool_output", output);
 HookManager.HookResult postResult = hookManager.runHooks("PostToolUse", hookContext);
+
+// 追加 PostToolUse Hook 消息到输出
 for (String msg : postResult.messages) {
     output += "\n[Hook note]: " + msg;
 }
 ```
 
-退出码 0 的 stdout 可包含结构化 JSON，支持修改工具输入：
+这一步最关键的不是代码量，而是心智：
 
-```java
-Map<String, Object> hookOutput = parseSimpleJson(stdoutStr);
-// updatedInput：更新工具输入参数
-// additionalContext：追加额外上下文
-// permissionDecision：覆盖权限决策
-```
+**hook 不是主循环的替代品，hook 是主循环在固定时机对外发出的调用。**
 
-## 变更对比
+## 这一章的教学边界
 
-| 组件          | S07         | S08                                 |
-|---------------|-------------|-------------------------------------|
-| Hook 系统     | （无）      | HookManager + .hooks.json           |
-| Hook 事件     | （无）      | SessionStart / PreToolUse / PostToolUse |
-| 退出码契约    | （无）      | 0(继续) / 1(阻断) / 2(注入)        |
-| 工作区信任    | （无）      | .claude/.claude_trusted 标记文件    |
-| Agent 循环    | 权限感知    | Hook 感知（工具前后包装 Hook）      |
+如果你后面继续扩展平台，hook 事件面当然会继续扩大。
+
+常见扩展方向包括：
+
+- 生命周期事件：开始、结束、配置变化
+- 工具事件：执行前、执行后、失败后
+- 压缩事件：压缩前、压缩后
+- 多 agent 事件：子 agent 启动、任务完成、队友空闲
+
+但教学仓这里要守住一个原则：
+
+**先把 hook 的统一模型讲清，再慢慢增加事件种类。**
+
+不要一开始就把几十种事件、几十套返回语义全部灌给读者。
+
+## 初学者最容易犯的错
+
+### 1. 把 hook 当成"到处插 if"
+
+如果还是散落在主循环里写条件分支，那还不是真正的 hook 设计。
+
+### 2. 没有统一的返回结构
+
+今天返回字符串，明天返回布尔值，后天返回整数，最后主循环一定会变乱。
+
+### 3. 一上来就把所有事件做全
+
+教学顺序应该是：
+
+1. 先学会 3 个事件
+2. 再学会统一返回协议
+3. 最后才扩事件面
+
+### 4. 忘了说明"教学版统一语义"和"高完成度细化语义"的区别
+
+如果这层不提前说清，读者后面看到更复杂实现时会以为前面学错了。
+
+其实不是学错了，而是：
+
+**先学统一模型，再学事件细化。**
+
+## 学完这一章，你应该真正掌握什么
+
+学完以后，你应该能自己清楚说出下面几句话：
+
+1. hook 的作用，是在固定时机扩展系统，而不是改写主循环。
+2. hook 至少需要"事件名 + payload + 返回结果"这三样东西。
+3. 教学版可以先用统一的 `0 / 1 / 2` 返回约定。
+4. `PreToolUse` 和 `PostToolUse` 已经足够支撑最核心的扩展能力。
+
+如果这 4 句话你已经能独立复述，说明这一章的核心心智已经建立起来了。
+
+## 下一章学什么
+
+这一章解决的是：
+
+> 在固定时机插入行为。
+
+下一章 `s09` 要解决的是：
+
+> 哪些信息应该跨会话留下，哪些不该留。
+
+也就是从"扩展点"进一步走向"持久状态"。
 
 ## 试一试
 
@@ -145,14 +365,10 @@ mvn compile exec:java -Dexec.mainClass="com.example.agent.sessions.S08HookSystem
 ```
 
 1. 创建 `.hooks.json` 文件，配置一个 PreToolUse Hook 拦截所有 bash 命令
-2. 在 Agent 中执行 `列出当前目录的文件`，观察 Hook 触发
+2. 在 Agent 中执行"列出当前目录的文件"，观察 Hook 触发
 3. 修改 Hook 返回退出码 1，观察工具被阻断
 4. 创建一个 PostToolUse Hook，在每次工具执行后注入额外提示
 
-## 要点总结
+---
 
-1. Hook 是子进程，通过退出码和 stdout/stderr 与 Agent 通信
-2. 三种退出码：0（继续）、1（阻断）、2（注入消息）
-3. Matcher 机制允许 Hook 只关注特定工具（`"*"` 匹配所有）
-4. 工作区信任门控防止恶意目录中的 Hook 被执行
-5. Hook 通过环境变量接收上下文，不需要解析命令行参数
+**一句话记住：hook 不是主循环的替代品，而是主循环在固定时机对外发出的调用。**

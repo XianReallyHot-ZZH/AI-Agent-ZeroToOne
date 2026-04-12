@@ -1,111 +1,440 @@
-# s16：团队协议
+# s16: Team Protocols (团队协议)
 
-`s01 > s02 > s03 > s04 > s05 > s06 | s07 > s08 > s09 > s10 > s11 > s12 > s13 > s14 > s15 > [ s16 ] s17 > s18 > s19`
+`s00 > s01 > s02 > s03 > s04 > s05 > s06 > s07 > s08 > s09 > s10 > s11 > s12 > s13 > s14 > s15 > [ s16 ] > s17 > s18 > s19`
 
-> *"协议 = 消息类型 + request_id 关联 + 状态机跟踪。"* —— 一种 FSM 模式，两种应用。
->
-> **装置层**：握手 —— Lead 与 Teammate 之间的结构化请求-响应。
+> *有了邮箱以后，团队已经能说话；有了协议以后，团队才开始会"按规矩协作"。*
 
-## 问题
+## 这一章要解决什么问题
 
-s15 的 `send_message` 是非结构化的。当 Lead 想关闭一个 Teammate 时，发一条消息然后寄希望于对方执行。没有确认，没有追踪请求是被批准还是被拒绝。你需要带关联 ID 的结构化握手机制。
+`s15` 已经让队友之间可以互相发消息。
 
-## 方案
+但如果所有事情都只靠自由文本，会有两个明显问题：
 
-```
-关闭协议：
-  Lead                                     Teammate
-    |                                         |
-    |--- shutdown_request(req_id: uuid-1) --->|
-    |                                         | （决定：批准或拒绝）
-    |<-- shutdown_response(req_id: uuid-1) ---|
-    |                                         |
-    |  （Lead 通过 req_id 匹配响应）           |
+- 某些动作必须明确批准或拒绝，不能只靠一句模糊回复
+- 一旦多个请求同时存在，系统很难知道"这条回复对应哪一件事"
 
-计划审批协议：
-  Teammate                                 Lead
-    |                                         |
-    |--- plan_request(req_id: uuid-2) ------->|
-    |                                         | （审查计划）
-    |<-- plan_approval(req_id: uuid-2) -------|
-    |                                         |
-    |  （Teammate 通过 req_id 检查响应）       |
+最典型的两个场景就是：
+
+1. 队友要不要优雅关机
+2. 某个高风险计划要不要先审批
+
+这两件事看起来不同，但结构其实一样：
+
+```text
+一方发请求
+另一方明确回复
+双方都能用同一个 request_id 对上号
 ```
 
-两种协议共享同一个 FSM：`pending -> approved | rejected`。关联通过匹配 `request_id` 实现。
+所以这一章要加的，不是更多自由聊天，而是：
 
-## 原理
+**一层结构化协议。**
 
-1. **TeamProtocol 在 `ConcurrentHashMap` 中追踪待处理请求：
+## 建议联读
+
+- 如果你开始把普通消息和协议请求混掉，先回 [`glossary.md`](./glossary.md) 和 [`entity-map.md`](./entity-map.md)。
+- 如果你准备继续读 `s17` 和 `s18`，建议先看 [`team-task-lane-model.md`](./team-task-lane-model.md)，这样后面自治认领和 worktree 车道不会一下子缠在一起。
+- 如果你想重新确认协议请求最终怎样回流到主系统，可以配合看 [`s00b-one-request-lifecycle.md`](./s00b-one-request-lifecycle.md)。
+
+## 先把几个词讲明白
+
+### 什么是协议
+
+协议可以简单理解成：
+
+> 双方提前约定好"消息长什么样、收到以后怎么处理"。
+
+### 什么是 request_id
+
+`request_id` 就是请求编号。
+
+它的作用是：
+
+- 某个请求发出去以后有一个唯一身份
+- 之后的批准、拒绝、超时都能准确指向这一个请求
+
+Java 版本使用 `UUID.randomUUID()` 生成：
 
 ```java
-TeamProtocol protocol = new TeamProtocol(bus);
-
-// 关闭请求 —— Lead 发起
-dispatcher.register("shutdown_request", input ->
-    protocol.requestShutdown((String) input.get("teammate"))
-);
-// 返回："Shutdown request sent to alice (req_id: uuid-1234)"
-
-// 检查关闭状态 —— Lead 检查
-dispatcher.register("shutdown_response", input ->
-    protocol.checkShutdownStatus((String) input.get("request_id"))
-);
-// 返回："alice: approved" 或 "alice: pending"
+String reqId = UUID.randomUUID().toString().substring(0, 8);
 ```
 
-2. **计划审批** —— Teammate 提交，Lead 审查：
+### 什么是请求-响应模式
 
-```java
-// Lead 审查 Teammate 的计划
-dispatcher.register("plan_approval", input ->
-    protocol.reviewPlan(
-        (String) input.get("request_id"),
-        Boolean.TRUE.equals(input.get("approve")),
-        (String) input.get("feedback"))
-);
-// 批准："Plan approved for req_id uuid-5678"
-// 拒绝："Plan rejected: needs more test coverage"
+这个词听起来像高级概念，其实很简单：
+
+```text
+请求方：我发起一件事
+响应方：我明确回答同意还是不同意
 ```
 
-3. **Request ID 关联。** 每个请求获得一个 UUID。响应携带相同的 UUID，实现异步关联：
+本章做的，就是把这种模式从"口头表达"升级成"结构化数据"。
+
+## 最小心智模型
+
+从教学角度，你可以先把协议看成两层：
+
+```text
+1. 协议消息
+2. 请求追踪表
+```
+
+### 协议消息
 
 ```java
-// TeamProtocol 内部：
-String requestId = UUID.randomUUID().toString();
-pendingShutdowns.put(requestId, Map.of(
-    "teammate", teammateName,
+Map<String, Object> envelope = Map.of(
+    "type", "shutdown_request",
+    "from", "lead",
+    "to", "alice",
+    "request_id", "req_001",
+    "content", "Please shut down gracefully."
+);
+```
+
+### 请求追踪表
+
+```java
+ConcurrentHashMap<String, Map<String, Object>> requests =
+    new ConcurrentHashMap<>();
+
+requests.put("req_001", Map.of(
+    "target", "alice",
     "status", "pending"
 ));
 ```
 
-4. **消息通过 MessageBus 传递。** 协议使用 s15 相同的 `bus.send()`，但使用结构化的消息类型：
+只要这两层都存在，系统就能同时回答：
 
-```
-{ type: "shutdown_request", request_id: "uuid-1", from: "lead" }
-{ type: "shutdown_response", request_id: "uuid-1", approved: true }
-{ type: "plan_request", request_id: "uuid-2", plan: "..." }
-{ type: "plan_approval", request_id: "uuid-2", approved: false, feedback: "..." }
-```
+- 现在发生了什么
+- 这件事目前走到哪一步
 
-## 变更对比
+## 关键数据结构
 
-| 组件          | s15                 | s16                               |
-|---------------|---------------------|-----------------------------------|
-| 通信          | 非结构化消息        | 结构化协议（shutdown、plan）      |
-| 关联机制      | （无）              | `request_id`（UUID）              |
-| 状态追踪      | （无）              | `ConcurrentHashMap` 待处理请求    |
-| 新工具        | 5 个（团队工具）    | +3：`shutdown_request`、`shutdown_response`、`plan_approval` |
-| 新增类        | （无）              | `TeamProtocol`                    |
+### 1. ProtocolEnvelope
 
-## 试一试
+协议消息通过 `MessageBus.send()` 传递，使用结构化的 `msg_type` 和 `metadata` 字段：
 
-```sh
-cd mini-agent-4j
-mvn compile exec:java -Dexec.mainClass="com.example.agent.sessions.S16TeamProtocols"
+```java
+bus.send("lead", "alice", "Please shut down gracefully.",
+    "shutdown_request",
+    Map.of("request_id", "req_001"));
 ```
 
-1. `生成一个叫 "alice" 的队友，角色是 "backend"`
-2. `给 alice 发一个任务，然后请求优雅关闭`
-3. `检查关闭请求的状态`
-4. `等待 alice 提交计划，然后审查它`
+它比普通消息多出来的关键部分就是：
+
+- `msg_type`：`shutdown_request` / `plan_approval` / `shutdown_response` / `plan_approval_response`
+- `metadata.request_id`：请求关联 ID
+- `metadata`：附加数据（如计划文本、审批结果）
+
+### 2. RequestRecord
+
+```java
+// shutdown 请求追踪
+ConcurrentHashMap<String, Map<String, Object>> shutdownRequests =
+    new ConcurrentHashMap<>();
+
+shutdownRequests.put("req_001", new ConcurrentHashMap<>(Map.of(
+    "target", "alice",
+    "status", "pending"
+)));
+
+// plan approval 请求追踪
+ConcurrentHashMap<String, Map<String, Object>> planRequests =
+    new ConcurrentHashMap<>();
+
+planRequests.put("req_002", new ConcurrentHashMap<>(Map.of(
+    "from", "bob",
+    "plan", "Refactor the auth module...",
+    "status", "pending"
+)));
+```
+
+它负责记录：
+
+- 这是哪种请求
+- 谁发给谁
+- 当前状态是什么
+
+`ConcurrentHashMap` 保证多个虚拟线程同时读写请求记录时的线程安全。
+
+如果你想把教学版再往真实系统推进一步，建议不要只放在内存字典里，而是直接落盘：
+
+```text
+.team/requests/
+  req_001.json
+  req_002.json
+```
+
+这样系统就能做到：
+
+- 请求状态可恢复
+- 协议过程可检查
+- 即使主循环继续往前，请求记录也不会丢
+
+### 3. 状态机
+
+本章里的状态机非常简单：
+
+```text
+pending -> approved
+pending -> rejected
+```
+
+这里再次提醒读者：
+
+`状态机` 的意思不是复杂理论，
+只是"状态之间如何变化的一张规则表"。
+
+在 Java 代码中，状态变更就是一行 `put`：
+
+```java
+req.put("status", approve ? "approved" : "rejected");
+```
+
+## 最小实现
+
+### 协议 1：优雅关机
+
+"优雅关机"的意思不是直接把线程硬砍掉。
+而是：
+
+1. 先发关机请求
+2. 队友明确回复同意或拒绝
+3. 如果同意，先收尾，再退出
+
+发请求（Lead 端）：
+
+```java
+private static String handleShutdownRequest(String teammate, MessageBus bus) {
+    String reqId = UUID.randomUUID().toString().substring(0, 8);
+    shutdownRequests.put(reqId, new ConcurrentHashMap<>(Map.of(
+        "target", teammate, "status", "pending")));
+    bus.send("lead", teammate, "Please shut down gracefully.",
+        "shutdown_request", Map.of("request_id", reqId));
+    return "Shutdown request " + reqId + " sent to '" + teammate + "' (status: pending)";
+}
+```
+
+收响应（Teammate 端）：
+
+```java
+// Teammate 的 shutdown_response 工具处理器
+toolHandlers.put("shutdown_response", input -> {
+    String reqId = (String) input.get("request_id");
+    boolean approve = Boolean.TRUE.equals(input.get("approve"));
+
+    // 更新 tracker 状态
+    var req = shutdownRequests.get(reqId);
+    if (req != null) {
+        req.put("status", approve ? "approved" : "rejected");
+    }
+
+    // 发送响应消息到 lead 的收件箱
+    bus.send(name, "lead", reason, "shutdown_response",
+        Map.of("request_id", reqId, "approve", approve));
+
+    return "Shutdown " + (approve ? "approved" : "rejected");
+});
+```
+
+Teammate 批准关机后，会设置 `shouldExit` 标志，下一轮读完收件箱后优雅退出。
+
+### 协议 2：计划审批
+
+这其实还是同一个请求-响应模板。
+
+比如某个队友想做高风险改动，可以先提计划：
+
+```java
+// Teammate 的 plan_approval 工具处理器
+toolHandlers.put("plan_approval", input -> {
+    String planText = (String) input.get("plan");
+    String reqId = UUID.randomUUID().toString().substring(0, 8);
+
+    // 记录到 plan tracker
+    planRequests.put(reqId, new ConcurrentHashMap<>(Map.of(
+        "from", name, "plan", planText, "status", "pending")));
+
+    // 发送到 lead 收件箱
+    bus.send(name, "lead", planText, "plan_approval",
+        Map.of("request_id", reqId, "plan", planText));
+
+    return "Plan submitted (request_id=" + reqId + "). Waiting for lead approval.";
+});
+```
+
+Lead 审批：
+
+```java
+private static String handlePlanReview(String requestId, boolean approve,
+                                       String feedback, MessageBus bus) {
+    var req = planRequests.get(requestId);
+    if (req == null) return "Error: Unknown plan request_id '" + requestId + "'";
+
+    // 更新状态
+    req.put("status", approve ? "approved" : "rejected");
+
+    // 发送审批结果给提交者
+    bus.send("lead", (String) req.get("from"),
+        feedback != null ? feedback : "",
+        "plan_approval_response",
+        Map.of("request_id", requestId, "approve", approve));
+
+    return "Plan " + req.get("status") + " for '" + req.get("from") + "'";
+}
+```
+
+看到这里，读者应该开始意识到：
+
+**本章最重要的不是"关机"或"计划"本身，而是同一个协议模板可以反复复用。**
+
+## 协议请求不是普通消息
+
+这一点一定要讲透。
+
+邮箱里虽然都叫"消息"，但 `s16` 以后其实已经分成两类：
+
+### 1. 普通消息
+
+适合：
+
+- 讨论
+- 提醒
+- 补充说明
+
+### 2. 协议消息
+
+适合：
+
+- 审批
+- 关机
+- 交接
+- 签收
+
+它至少要带：
+
+- `msg_type`（如 `shutdown_request`、`plan_approval`）
+- `metadata.request_id`
+- `from`
+- `content`
+
+最简单的记法是：
+
+- 普通消息解决"说了什么"
+- 协议消息解决"这件事走到哪一步了"
+
+## 如何接到团队系统里
+
+这章真正补上的，不只是两个新工具名，而是一条新的协作回路：
+
+```text
+某个队友 / lead 发起请求
+  ->
+写入 ConcurrentHashMap tracker
+  ->
+把协议消息投递进对方 inbox（通过 MessageBus.send）
+  ->
+对方下一轮 drain inbox
+  ->
+按 request_id 更新请求状态
+  ->
+必要时再回一条 response
+  ->
+请求方根据 approved / rejected 继续后续动作
+```
+
+你可以把它理解成：
+
+- `s15` 给了团队"邮箱"
+- `s16` 现在给邮箱里的某些消息加上"编号 + 状态机 + 回执"
+
+如果少了这条结构化回路，团队虽然能沟通，但无法稳定协作。
+
+## MessageEnvelope、ProtocolEnvelope、RequestRecord、TaskRecord 的边界
+
+这 4 个对象很容易一起打结。最稳的记法是：
+
+| 对象 | 它回答什么问题 | 典型字段 |
+|---|---|---|
+| `MessageEnvelope` | 谁跟谁说了什么 | `from` / `content` / `msg_type` |
+| `ProtocolEnvelope` | 这是不是一条结构化请求或响应 | `msg_type` / `metadata.request_id` / `metadata` |
+| `RequestRecord` | 这件协作流程现在走到哪一步 | `target` 或 `from` / `status` / `plan` |
+| `TaskRecord` | 真正的工作项是什么、谁在做、还卡着谁 | `subject` / `status` / `blockedBy` / `owner` |
+
+一定要牢牢记住：
+
+- 协议请求不是任务本身
+- 请求状态表也不是任务板
+- 协议只负责"协作流程"
+- 任务系统才负责"真正的工作推进"
+
+## 这一章的教学边界
+
+教学版先只讲 2 类协议就够了：
+
+- `shutdown`
+- `plan_approval`
+
+因为这两类已经足够把下面几件事讲清楚：
+
+- 什么是结构化消息
+- 什么是 request_id
+- 为什么要有请求状态表
+- 为什么协议不是自由文本
+
+等这套模板学稳以后，你完全可以再扩展：
+
+- 任务认领协议
+- 交接协议
+- 结果签收协议
+
+但这些都应该建立在本章的统一模板之上。
+
+## 初学者最容易犯的错
+
+### 1. 没有 `request_id`
+
+没有编号，多个请求同时存在时很快就会乱。
+
+### 2. 收到请求以后只回一句自然语言
+
+例如：
+
+```text
+好的，我知道了
+```
+
+人类可能看得懂，但系统很难稳定处理。
+
+### 3. 没有请求状态表
+
+如果系统不记录 `pending` / `approved` / `rejected`，协议其实就没有真正落地。
+
+Java 版本用两个 `ConcurrentHashMap` 分别追踪 shutdown 和 plan 请求，保证线程安全。
+
+### 4. 把协议消息和普通消息混成一种结构
+
+这样后面一多，处理逻辑会越来越混。
+
+## 学完这一章，你应该真正掌握什么
+
+学完以后，你应该能独立复述下面几件事：
+
+1. 团队协议的核心，是"请求-响应 + request_id + 状态表"。
+2. 协议消息和普通聊天消息不是一回事。
+3. 关机协议和计划审批虽然业务不同，但底层模板可以复用。
+4. 团队一旦进入结构化协作，就要靠协议，而不是只靠自然语言。
+
+如果这 4 点已经非常稳定，说明这一章真正学到了。
+
+## 下一章学什么
+
+这一章解决的是：
+
+> 团队如何按规则协作。
+
+下一章 `s17` 要解决的是：
+
+> 如果没有人每次都手动派活，队友能不能在空闲时自己找任务、自己恢复工作。
+
+也就是从"协议化协作"继续走向"自治行为"。

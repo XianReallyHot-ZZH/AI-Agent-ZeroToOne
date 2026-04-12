@@ -129,6 +129,7 @@ system prompt (SystemPromptBuilder)
 
 - `s09`（`S09MemorySystem.java`）memory
 - `s10`（`S10SystemPrompt.java`）system prompt
+- `s10a` message & prompt pipeline
 
 这一段的核心心智是：
 
@@ -189,6 +190,7 @@ Tool Router
 如果你对这一层不够清楚，回看：
 
 - [`s02-tool-use.md`](./s02-tool-use.md)（`S02ToolUse.java`）
+- [`s02a-tool-control-plane.md`](./s02a-tool-control-plane.md）
 
 ## 第 5 段：权限系统决定"能不能执行"
 
@@ -267,6 +269,7 @@ deny rules (PermissionManager)
 相关章节：
 
 - [`s13-background-tasks.md`](./s13-background-tasks.md)（`S13BackgroundTasks.java`）
+- [`s13a-runtime-task-model.md`](./s13a-runtime-task-model.md）
 
 ### 例子 4：多 agent / teammate
 
@@ -293,6 +296,7 @@ deny rules (PermissionManager)
 相关章节：
 
 - [`s19-mcp-plugin.md`](./s19-mcp-plugin.md)（`S19McpPlugin.java`）
+- [`s19a-mcp-capability-layers.md`](./s19a-mcp-capability-layers.md）
 
 ## 第 8 段：执行结果被包装回消息流
 

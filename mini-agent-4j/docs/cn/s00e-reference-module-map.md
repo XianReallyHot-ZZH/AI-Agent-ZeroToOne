@@ -76,7 +76,7 @@ java standard library     -- JDK 21+ 标准库
 | 参考仓库模块簇 | 典型例子 | Java 教学章节 | 内部类/核心结构 | 为什么这样放是对的 |
 |---|---|---|---|---|
 | 查询主循环 + 控制状态 | `Tool.ts`、`AppStateStore.ts`、query / coordinator 状态 | `s00`、`s00a`、`s00b`、`s01`、`s11` | `QueryState`（s00a桥接）、`LoopState`（s01） | 真实系统绝不只是 `List<Message> + while (true)`。教学上先讲最小循环，再补控制平面，是对的。 |
-| 工具路由与执行面 | `Tool.ts`、原生 tools、tool context | `s02` | `safePath()`、`runRead()`/`runWrite()`/`runEdit()`、`TOOL_HANDLERS`（Map） | 参考仓库明确把 tools 做成统一执行面。Java 版用 `Map<String, Function<...>>` 实现分发表。 |
+| 工具路由与执行面 | `Tool.ts`、原生 tools、tool context | `s02`、`s02a`、`s02b` | `safePath()`、`runRead()`/`runWrite()`/`runEdit()`、`TOOL_HANDLERS`（Map） | 参考仓库明确把 tools 做成统一执行面。Java 版用 `Map<String, Function<...>>` 实现分发表。 |
 | 会话规划 | `TodoWriteTool` | `s03` | `PlanItem`（record）、`PlanningState`、`TodoManager` | 这是"当前会话怎么不乱撞"的小结构，应该早于持久任务图。 |
 | 一次性委派 | `AgentTool` 的最小子集 | `s04` | `AgentTemplate`（record）、`runSubagent()` | Java 版先教"新上下文 + 子任务 + 摘要返回"这个最小正确版本。 |
 | 技能发现与按需加载 | `DiscoverSkillsTool`、`skills/*` | `s05` | `SkillManifest`（record）、`SkillDocument`（record）、`SkillRegistry` | 技能不是花哨外挂，而是知识注入层，应早于 prompt 复杂化和上下文压力。 |
@@ -84,16 +84,16 @@ java standard library     -- JDK 21+ 标准库
 | 权限闸门 | `types/permissions.ts`、`hooks/toolPermission/*` | `s07` | `BashSecurityValidator`、`PermissionManager` | 执行安全是明确闸门，必须早于 hook。Java 版用枚举 `PermissionDecision` 表达判定结果。 |
 | Hook 与侧边扩展 | `types/hooks.ts`、hook runner | `s08` | `HookManager`、`HookPoint`（枚举） | 扩展点和权限分开。教学顺序保持"先 gate，再 extend"。 |
 | 持久记忆选择 | `memdir/*`、`SessionMemory/*` | `s09` | `MemoryManager`、`DreamConsolidator` | Java 版把 memory 处理成"跨会话、选择性装配"的层。 |
-| Prompt 组装 | `prompts.ts`、prompt sections | `s10` | `SystemPromptBuilder`、`buildSystemReminder()` | 输入拆成多个 section，讲成流水线而不是一段大字符串。 |
+| Prompt 组装 | `prompts.ts`、prompt sections | `s10`、`s10a` | `SystemPromptBuilder`、`buildSystemReminder()` | 输入拆成多个 section，讲成流水线而不是一段大字符串。 |
 | 恢复与续行 | query transition、retry 分支 | `s11`、`s00c` | `estimateTokens()`、`autoCompact()`、`backoffDelay()` | "为什么继续下一轮"是显式存在的，所以恢复应晚于 loop / tools / compact / permissions / memory / prompt。 |
 | 持久工作图 | 任务记录、任务板、依赖解锁 | `s12` | `TaskManager`、`TaskRecord`（record） | "持久任务目标"和"会话内待办"分开。 |
-| 活着的运行时任务 | `tasks/types.ts`、`LocalShellTask`、`LocalAgentTask` | `s13` | `NotificationQueue`、`BackgroundManager` | runtime task 是明确独立状态。`TaskRecord` 和运行时槽位必须分开教。 |
+| 活着的运行时任务 | `tasks/types.ts`、`LocalShellTask`、`LocalAgentTask` | `s13`、`s13a` | `NotificationQueue`、`BackgroundManager` | runtime task 是明确独立状态。`TaskRecord` 和运行时槽位必须分开教。 |
 | 定时触发 | `ScheduleCronTool/*` | `s14` | `CronLock`、`CronScheduler`、`cronMatches()` | 调度建在 runtime work 之上的新启动条件。 |
 | 持久队友 | `InProcessTeammateTask`、team tools | `s15` | `MessageBus`、`TeammateManager` | 从一次性 subagent 继续长成长期 actor。 |
 | 结构化团队协作 | send-message 流、request tracking | `s16` | `RequestStore`、`TeammateManager` | 协议建立在"已有持久 actor"之上。 |
 | 自治认领与恢复 | coordinator mode、任务认领 | `s17` | `isClaimableTask()`、`claimTask()`、`ensureIdentityContext()` | 自治建立在 actor、任务和协议之上。 |
 | Worktree 执行车道 | `EnterWorktreeTool`、`ExitWorktreeTool` | `s18` | `TaskManager`、`WorktreeManager`、`EventBus` | worktree 当作执行边界 + 收尾状态。 |
-| 外部能力总线 | `MCPTool`、`services/mcp/*`、`plugins/*` | `s19` | `CapabilityPermissionGate`、`MCPClient`、`PluginLoader`、`MCPToolRouter` | MCP / plugin 放在平台最外层边界。 |
+| 外部能力总线 | `MCPTool`、`services/mcp/*`、`plugins/*` | `s19`、`s19a` | `CapabilityPermissionGate`、`MCPClient`、`PluginLoader`、`MCPToolRouter` | MCP / plugin 放在平台最外层边界。 |
 
 ## 这份对照最能证明的 5 件事
 

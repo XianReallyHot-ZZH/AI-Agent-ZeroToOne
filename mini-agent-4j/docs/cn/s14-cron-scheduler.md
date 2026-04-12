@@ -1,157 +1,359 @@
 # s14：定时调度
 
-`s01 > s02 > s03 > s04 > s05 > s06 | s07 > s08 > s09 > s10 > s11 > s12 > s13 > [ s14 ] s15 > s16 > s17 > s18 > s19`
+`s01 > s02 > s03 > s04 > s05 > s06 | s07 > s08 > s09 > s10 > s11 > s12 > s13 > [ s14 ] > s15 > s16 > s17 > s18 > s19`
 
-> *"调度记住未来的工作，然后在时间到达时将其交还给同一个主循环。"* —— Agent 不仅能响应现在，还能规划未来。
+> *如果后台任务解决的是"稍后回来拿结果"，那么定时调度解决的是"将来某个时间再开始做事"。*
 
-## 课程目标
+## 这一章要解决什么问题
 
-理解如何为 Agent 构建基于 cron 表达式的定时调度系统。Agent 可以调度未来的任务，当时间到达时自动将提示词注入主对话循环。
+`s13` 已经让系统学会了把慢命令放到后台。
 
-## 问题
+但后台任务默认还是"现在就启动"。
 
-有些工作需要在特定时间执行：每天早上检查构建状态、每周一生成报告、每隔 5 分钟监控服务健康。如果 Agent 不能调度未来工作，用户就必须手动在正确的时间发出指令。
+很多真实需求并不是现在做，而是：
 
-## 方案
+- 每天晚上跑一次测试
+- 每周一早上生成报告
+- 30 分钟后提醒我继续检查某个结果
 
-后台线程每秒检查一次调度表，匹配的任务将通知推入队列，主循环在下次 LLM 调用前排空并注入：
+如果没有调度能力，用户就只能每次手动再说一遍。
+这会让系统看起来像"只能响应当下"，而不是"能安排未来工作"。
 
+所以这一章要加上的能力是：
+
+**把一条未来要执行的意图，先记下来，等时间到了再触发。**
+
+## 建议联读
+
+- 如果你还没完全分清 `schedule`、`task`、`runtime task` 各自表示什么，先回 [s13a-runtime-task-model.md](./s13a-runtime-task-model.md)。
+- 如果你想重新看清"一条触发最终是怎样回到主循环里的"，可以配合读 [s00b-one-request-lifecycle.md](./s00b-one-request-lifecycle.md)。
+- 如果你开始把"未来触发"误以为"又多了一套执行系统"，先回 [data-structures.md](./data-structures.md)，确认调度记录和运行时记录不是同一个表。
+
+## 先解释几个名词
+
+### 什么是调度器
+
+调度器，就是一段专门负责"看时间、查任务、决定是否触发"的代码。
+
+在 Java 实现里，调度器是 `CronScheduler` 内部类，它在后台线程中每秒检查一次所有任务。
+
+### 什么是 cron 表达式
+
+`cron` 是一种很常见的定时写法。
+
+最小 5 字段版本长这样：
+
+```text
+分 时 日 月 周
 ```
-+-------------------------------+
-|  后台线程                      |
-|  (每秒检查一次)                |
-|                               |
-|  对每个任务:                    |
-|    if cronMatches(now):       |
-|      将通知加入队列             |
-+-------------------------------+
-          |
-          v
-[notification_queue]
-          |
-     (agentLoop 顶部排空)
-          |
-          v
-[在 LLM 调用前作为 user 消息注入]
+
+例如：
+
+```text
+*/5 * * * *   每 5 分钟
+0 9 * * 1     每周一 9 点
+30 14 * * *   每天 14:30
 ```
 
-Cron 表达式支持 5 个字段：
+如果你是初学者，不用先背全。
 
+这一章真正重要的不是语法细节，而是：
+
+> "系统如何把一条未来任务记住，并在合适时刻放回主循环。"
+
+### 什么是持久化调度
+
+持久化，意思是：
+
+> 就算程序重启，这条调度记录还在。
+
+Java 实现通过 `durable` 标记区分两种存储模式：
+
+| 模式           | 存储                           | 生命周期       |
+|---------------|-------------------------------|---------------|
+| session-only  | 内存列表                       | 退出后丢失     |
+| durable       | `.claude/scheduled_tasks.json` | 退出后保留     |
+
+## 最小心智模型
+
+先把调度看成 3 个部分：
+
+```text
+1. 调度记录 (ScheduleRecord)
+2. 定时检查器 (checkLoop 后台线程)
+3. 通知队列 (ConcurrentLinkedQueue<String>)
 ```
-+-------+-------+-------+-------+-------+
-| min   | hour  | dom   | month | dow   |
-| 0-59  | 0-23  | 1-31  | 1-12  | 0-6   |
-+-------+-------+-------+-------+-------+
-*/5 * * * *     → 每 5 分钟
-0 9 * * 1       → 每周一上午 9:00
-30 14 * * *     → 每天 14:30
+
+它们之间的关系是：
+
+```text
+cron_create(cron_expr, prompt, recurring, durable)
+  ->
+把记录写到任务列表（durable 时还落盘到 .claude/scheduled_tasks.json）
+  ->
+后台线程每秒看一次"当前分钟是否匹配"
+  ->
+如果匹配，就把 prompt 放进通知队列
+  ->
+主循环下一轮把它当成新的用户消息喂给模型
 ```
 
-## 核心概念
+这条链路很重要。
 
-### CronScheduler —— 调度器
+因为它说明了一点：
+
+**定时调度并不是另一套 agent。它最终还是回到同一条主循环。**
+
+## 关键数据结构
+
+### 1. ScheduleRecord
 
 ```java
-public static class CronScheduler {
-    private final List<Map<String, Object>> tasks;                        // 任务列表
-    private final ConcurrentLinkedQueue<String> notificationQueue;        // 通知队列
-    private final AtomicInteger lastCheckMinute;                          // 每分钟最多触发一次
+Map<String, Object> task = new LinkedHashMap<>();
+task.put("id",         "job_001");           // 唯一编号（UUID 前 8 位）
+task.put("cron",       "0 9 * * 1");         // 定时规则
+task.put("prompt",     "Run the weekly status report.");  // 到点后注入主循环的提示
+task.put("recurring",  true);                // 是否反复触发
+task.put("durable",    true);                // 是否落盘保存
+task.put("createdAt",  System.currentTimeMillis() / 1000.0);  // 创建时间（epoch 秒）
+// recurring 时额外添加：
+task.put("jitter_offset", computeJitter("0 9 * * 1"));  // 抖动偏移（Java 特有）
+```
 
-    public void start();          // 加载持久化任务，启动后台线程
-    public String create(...);    // 创建新任务
-    public String delete(...);    // 删除任务
-    public String listTasks();    // 列出所有任务
-    public List<String> drainNotifications();  // 排空通知队列
+字段含义：
+
+- `id`：唯一编号
+- `cron`：定时规则（5 字段 cron 表达式）
+- `prompt`：到点后要注入主循环的提示
+- `recurring`：是不是反复触发（false 为一次性，触发后自动删除）
+- `durable`：是否落盘保存
+- `createdAt`：创建时间
+- `jitter_offset`：抖动偏移（Java 特有，见下文）
+
+### 2. 调度通知
+
+```java
+// 匹配时推入通知队列的字符串
+String notification = "[Scheduled task job_001]: Run the weekly status report.";
+// 使用 ConcurrentLinkedQueue<String>，线程安全
+```
+
+### 3. 检查周期
+
+Java 实现的后台线程每秒检查一次，但通过 `AtomicInteger lastCheckMinute` 保证每分钟最多触发一次：
+
+```java
+int currentMinute = now.getHour() * 60 + now.getMinute();
+if (currentMinute != lastCheckMinute.get()) {
+    lastCheckMinute.set(currentMinute);
+    checkTasks(now);
 }
 ```
 
-### cronMatches —— 5 字段匹配
+教学版先按"分钟级"思考就足够，因为大多数 cron 任务本来就不是为了卡秒执行。
+
+## 最小实现
+
+### 第一步：允许创建一条调度记录
 
 ```java
-public static boolean cronMatches(String expr, LocalDateTime dt) {
-    String[] fields = expr.trim().split("\\s+");
-    // 逐字段检查：分钟、小时、日、月、星期
-    // 支持: *(任意) */N(步进) N(精确) N-M(范围) N,M(列表)
-}
-```
+public String create(String cronExpr, String prompt, boolean recurring, boolean durable) {
+    String taskId = UUID.randomUUID().toString().substring(0, 8);
+    double createdAt = System.currentTimeMillis() / 1000.0;
 
-### 两种持久化模式
+    Map<String, Object> task = new LinkedHashMap<>();
+    task.put("id", taskId);
+    task.put("cron", cronExpr);
+    task.put("prompt", prompt);
+    task.put("recurring", recurring);
+    task.put("durable", durable);
+    task.put("createdAt", createdAt);
 
-| 模式         | 存储                       | 生命周期           |
-|-------------|---------------------------|-------------------|
-| session-only | 内存列表                   | 退出后丢失         |
-| durable      | .claude/scheduled_tasks.json | 退出后保留      |
-
-### 两种触发模式
-
-| 模式       | 行为                           |
-|-----------|-------------------------------|
-| recurring | 重复执行，7 天后自动过期         |
-| one-shot  | 触发一次后自动删除              |
-
-### 抖动机制
-
-recuring 任务如果指向精确的 :00 或 :30 分钟，添加确定性抖动偏移（1-4 分钟），避免所有任务在整点集中触发：
-
-```java
-private int computeJitter(String cronExpr) {
-    int minuteVal = Integer.parseInt(fields[0]);
-    if (JITTER_MINUTES.contains(minuteVal)) {
-        return (Math.abs(cronExpr.hashCode()) % JITTER_OFFSET_MAX) + 1;
+    // recurring 任务添加抖动偏移（Java 特有机制）
+    if (recurring) {
+        task.put("jitter_offset", computeJitter(cronExpr));
     }
-    return 0;
+
+    tasks.add(task);
+    if (durable) {
+        saveDurable();  // 落盘到 .claude/scheduled_tasks.json
+    }
+    return "Created task " + taskId + " (" + mode + ", " + store + "): cron=" + cronExpr;
 }
 ```
 
-## 关键代码片段
-
-Agent 循环在每次 LLM 调用前排空调度通知：
+### 第二步：写一个定时检查循环
 
 ```java
-while (true) {
-    // 排空调度通知并注入对话
-    List<String> notifications = scheduler.drainNotifications();
-    for (String note : notifications) {
-        paramsBuilder.addUserMessage(note);
+private void checkLoop() {
+    while (!stopRequested.get()) {
+        LocalDateTime now = LocalDateTime.now();
+        int currentMinute = now.getHour() * 60 + now.getMinute();
+
+        // 每分钟只检查一次，避免重复触发
+        if (currentMinute != lastCheckMinute.get()) {
+            lastCheckMinute.set(currentMinute);
+            checkTasks(now);
+        }
+
+        try {
+            TimeUnit.SECONDS.sleep(1);  // 每秒唤醒一次
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            break;
+        }
+    }
+}
+```
+
+后台线程每秒唤醒，但通过 `lastCheckMinute` 去重，保证同一分钟内不会重复触发。
+
+### 第三步：时间到了就发通知
+
+```java
+private void checkTasks(LocalDateTime now) {
+    for (Map<String, Object> task : snapshot) {
+        // 自动过期检查：recurring 任务超过 7 天（Java 特有）
+        double ageDays = (nowEpoch - createdAt) / 86400.0;
+        if (recurring && ageDays > AUTO_EXPIRY_DAYS) {
+            expired.add(taskId);
+            continue;
+        }
+
+        // 应用抖动偏移（Java 特有）
+        LocalDateTime checkTime = now;
+        if (jitter_offset > 0) {
+            checkTime = now.minusMinutes(jitter_offset);
+        }
+
+        // cron 匹配检查
+        if (cronMatches(cron, checkTime)) {
+            String notification = "[Scheduled task " + taskId + "]: " + prompt;
+            notificationQueue.add(notification);
+            task.put("last_fired", nowEpoch);
+
+            // 一次性任务触发后标记删除
+            if (!recurring) {
+                firedOneShots.add(taskId);
+            }
+        }
     }
 
-    // 正常 LLM 调用
-    Message response = client.messages().create(paramsBuilder.build());
-    // ...
+    // 清理过期和已完成的一次性任务
+    if (!expired.isEmpty() || !firedOneShots.isEmpty()) {
+        tasks.removeIf(t -> removeIds.contains(t.get("id")));
+        saveDurable();
+    }
 }
 ```
 
-3 个调度工具定义：
+### 第四步：主循环像处理后台通知一样处理定时通知
 
 ```java
-defineTool("cron_create", "Schedule a recurring or one-shot task with a cron expression.",
-    Map.of("cron", ..., "prompt", ..., "recurring", ..., "durable", ...),
-    List.of("cron", "prompt"));
+// agentLoop 中，在每次 LLM 调用之前
+List<String> notifications = scheduler.drainNotifications();
+for (String note : notifications) {
+    paramsBuilder.addUserMessage(note);
+}
 
-defineTool("cron_delete", "Delete a scheduled task by ID.",
-    Map.of("id", ...), List.of("id"));
-
-defineTool("cron_list", "List all scheduled tasks.", Map.of(), null);
+// 正常调用 LLM
+Message response = client.messages().create(paramsBuilder.build());
 ```
 
-REPL 测试命令：
+这样一来，定时任务最终还是由模型接手继续做。
 
-```
-/cron      # 列出所有调度任务
-/test      # 手动注入测试通知
-```
+## 为什么这章放在后台任务之后
 
-## 变更对比
+因为这两章解决的问题很接近，但不是同一件事。
 
-| 组件          | S13           | S14                                  |
-|---------------|---------------|--------------------------------------|
-| Cron 匹配     | （无）        | 5 字段 cron 表达式解析               |
-| 调度器        | （无）        | CronScheduler（后台线程 + 通知队列） |
-| 持久化        | （无）        | .claude/scheduled_tasks.json         |
-| 调度工具      | （无）        | cron_create / cron_delete / cron_list |
-| Agent 循环    | 标准循环      | 循环顶部排空通知队列                 |
-| 抖动          | （无）        | 整点任务确定性偏移                   |
-| 自动过期      | （无）        | 7 天后自动清理                       |
+可以这样区分：
+
+| 机制 | 回答的问题 |
+|---|---|
+| 后台任务 | "已经启动的慢操作，结果什么时候回来？" |
+| 定时调度 | "一件事应该在未来什么时候开始？" |
+
+这个顺序对初学者很友好。
+
+因为先理解"异步结果回来"，再理解"未来触发一条新意图"，心智会更顺。
+
+## 初学者最容易犯的错
+
+### 1. 一上来沉迷 cron 语法细节
+
+这章最容易跑偏到一大堆表达式规则。
+
+但教学主线其实不是"背语法"，而是：
+
+**调度记录如何进入通知队列，又如何回到主循环。**
+
+### 2. 没有 `last_fired`
+
+没有这个字段，系统很容易在短时间内重复触发同一条任务。
+
+Java 实现通过 `lastCheckMinute`（`AtomicInteger`）在检查循环层面防止同一分钟重复触发，并在任务级别记录 `last_fired` 时间戳。
+
+### 3. 只放内存，不支持落盘
+
+如果用户希望"明天再提醒我"，程序一重启就没了，这就不是真正的调度。
+
+Java 实现提供了 `durable` 模式，将任务保存到 `.claude/scheduled_tasks.json`，启动时自动加载。
+
+### 4. 把调度触发结果直接在后台默默执行
+
+教学主线里更清楚的做法是：
+
+- 时间到了
+- 先发通知（推入 `ConcurrentLinkedQueue`）
+- 再让主循环决定怎么处理
+
+这样系统行为更透明，读者也更容易理解。
+
+### 5. 误以为定时任务必须绝对准点
+
+很多初学者会把调度想成秒表。
+
+但这里更重要的是"有计划地触发"，而不是追求毫秒级精度。
+
+Java 实现的抖动机制（`computeJitter`）甚至刻意让整点任务偏移 1-4 分钟，避免所有任务在精确的 `:00` 或 `:30` 集中触发。
+
+## 如何接到整个系统里
+
+到了这一章，系统已经有两条重要的"外部事件输入"：
+
+- 后台任务完成通知（`LinkedBlockingQueue`，s13）
+- 定时调度触发通知（`ConcurrentLinkedQueue`，s14）
+
+二者最好的统一方式是：
+
+**都走通知队列，再在下一次模型调用前统一注入。**
+
+这样主循环结构不会越来越乱。
+
+Java 实现中，`CronLock`（PID 文件锁）还确保了同一时间只有一个调度器实例在运行，防止多个终端同时启动导致重复触发。
+
+## 教学边界
+
+这一章先讲清一条主线就够了：
+
+**调度器做的是"记住未来"，不是"取代主循环"。**
+
+所以教学版先只需要让读者看清：
+
+- schedule record 负责记住未来何时开工
+- 真正执行工作时，仍然回到任务系统和通知队列
+- 它只是多了一种"开始入口"，不是多了一条新的主循环
+
+Java 实现有两个教学范围之外但值得了解的增强：
+
+1. **抖动机制（`computeJitter`）**：recurring 任务如果指向精确的 `:00` 或 `:30`，会基于 cron 表达式哈希值确定性偏移 1-4 分钟，避免整点扎堆。
+2. **自动过期（7 天）**：recurring 任务创建超过 7 天后自动清理，防止调度表无限膨胀。
+
+多进程锁（`CronLock`）、漏触发补报、自然语言时间语法这些，都应该排在这条主线之后。
+
+## 一句话记住
+
+**后台任务是在"等结果"，定时调度是在"等开始"。**
 
 ## 试一试
 
@@ -160,17 +362,10 @@ cd mini-agent-4j
 mvn compile exec:java -Dexec.mainClass="com.example.agent.sessions.S14CronScheduler"
 ```
 
-1. 输入 `创建一个每分钟执行的定时任务，检查当前时间并报告`
-2. 等待 1 分钟，观察通知被自动注入
-3. 输入 `/cron` 查看任务列表
-4. 输入 `/test` 手动触发一条测试通知
-5. 创建一个 durable 任务，退出后重启，观察任务自动加载
+可以试试这些任务：
 
-## 要点总结
-
-1. 后台线程每秒检查，每分钟每任务最多触发一次
-2. 通知队列在 Agent 循环顶部排空，注入为 user 消息
-3. Cron 表达式支持标准语法：*、*/N、N-M、N,M
-4. durable 任务持久化到磁盘，session-only 只在内存
-5. recurring 任务 7 天自动过期，one-shot 触发后自动删除
-6. 抖动机制防止整点集中触发
+1. 输入 `创建一个每分钟执行的定时任务，检查当前时间并报告`，观察它是否会按时进入通知队列。
+2. 创建一个一次性（one-shot）任务，确认触发后是否会自动消失。
+3. 创建一个 durable 任务，退出程序后重启，检查持久化的调度记录是否还在。
+4. 输入 `/cron` 查看所有调度任务。
+5. 输入 `/test` 手动触发一条测试通知，观察它如何注入对话。

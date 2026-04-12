@@ -171,6 +171,7 @@ CLI 入口当然有用，但它不应该成为第一屏。
 如果你开始混，先回：
 
 - [`s00a-query-control-plane.md`](./s00a-query-control-plane.md)
+- [`s10a-message-prompt-pipeline.md`](./s10a-message-prompt-pipeline.md)
 - [`s00c-query-transition-model.md`](./s00c-query-transition-model.md)
 
 ## 阶段 3：`s12-s14` 应该怎样读代码

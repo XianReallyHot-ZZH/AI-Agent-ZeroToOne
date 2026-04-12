@@ -1,41 +1,128 @@
-# s10：系统提示词组装
+# s10: System Prompt Construction (系统提示词构建)
 
-`s01 > s02 > s03 > s04 > s05 > s06 | s07 > s08 > s09 > [ s10 ] s11 > s12 > s13 > s14 > s15 > s16 > s17 > s18 > s19`
+`s00 > s01 > s02 > s03 > s04 > s05 > s06 > s07 > s08 > s09 > [ s10 ] > s11 > s12 > s13 > s14 > s15 > s16 > s17 > s18 > s19`
 
-> *"系统提示词的构建是一条有边界的流水线，不是一个大字符串。"* —— 清晰的段落比巨大的文本块更容易推理和演进。
+> *系统提示词不是一整块大字符串，而是一条可维护的组装流水线。*
 
-## 课程目标
+## 这一章为什么重要
 
-理解如何将系统提示词拆分为多个独立段落，按需组装。每个段落职责单一，使得提示词更容易推理、测试和迭代。
+很多初学者一开始会把 system prompt 写成一大段固定文本。
 
-## 问题
+这样在最小 demo 里当然能跑。
 
-系统提示词如果写成一个巨大的硬编码字符串，会变得难以维护。模型需要知道它的身份、可用工具、项目约定、用户偏好、当前日期等多种信息，这些信息来源不同、更新频率不同。需要一个结构化的组装机制。
+但一旦系统开始长功能，你很快会遇到这些问题：
 
-## 方案
+- 工具列表会变
+- skills 会变
+- memory 会变
+- 当前目录、日期、模式会变
+- 某些提醒只在这一轮有效，不该永远塞进系统说明
 
-系统提示词由 6 个段落依次组装，稳定内容与动态内容通过 `DYNAMIC_BOUNDARY` 标记分离：
+所以到了这个阶段，system prompt 不能再当成一块硬编码文本。
 
+它应该升级成：
+
+**由多个来源共同组装出来的一条流水线。**
+
+## 建议联读
+
+- 如果你还习惯把 prompt 看成"神秘大段文本"，先回 [`s00a-query-control-plane.md`](./s00a-query-control-plane.md)，重新确认模型输入在进模型前经历了哪些控制层。
+- 如果你想真正稳住"哪些内容先拼、哪些后拼"，建议把 [`s10a-message-prompt-pipeline.md`](./s10a-message-prompt-pipeline.md) 放在手边，这页就是本章最关键的桥。
+- 如果你开始把 system rules、工具说明、memory、runtime state 混成一个大块，先看 [`data-structures.md`](./data-structures.md)，把这些输入片段的来源重新拆开。
+
+## 先解释几个名词
+
+### 什么是 system prompt
+
+system prompt 是给模型的系统级说明。
+
+它通常负责告诉模型：
+
+- 你是谁
+- 你能做什么
+- 你应该遵守什么规则
+- 你现在处在什么环境里
+
+### 什么是"组装流水线"
+
+意思是：
+
+- 不同信息来自不同地方
+- 最后按顺序拼接成一份输入
+
+它不是一个死字符串，而是一条构建过程。
+
+### 什么是动态信息
+
+有些信息经常变化，例如：
+
+- 当前日期
+- 当前工作目录
+- 本轮新增的提醒
+
+这些信息不适合和所有稳定说明混在一起。
+
+## 最小心智模型
+
+最容易理解的方式，是把 system prompt 想成 6 段：
+
+```text
+1. 核心身份和行为说明
+2. 工具列表
+3. skills 元信息
+4. memory 内容
+5. CLAUDE.md 指令链
+6. 动态环境信息
 ```
-+----------------------------------+
-| 段落 1: core instructions        | ─┐
-| 段落 2: tool listing             |  │ 稳定内容
-| 段落 3: skill metadata           |  │ (可跨轮次缓存)
-| 段落 4: memory section           |  │
-| 段落 5: CLAUDE.md chain          | ─┘
-+==================================+  ← DYNAMIC_BOUNDARY
-| 段落 6: dynamic context          | ── 动态内容 (每轮重建)
-+----------------------------------+
+
+然后按顺序拼起来：
+
+```text
+core
++ tools
++ skills
++ memory
++ claude_md
++ dynamic_context
+= final system prompt
 ```
 
-## 核心概念
+## 为什么不能把所有东西都硬塞进一个大字符串
 
-### SystemPromptBuilder —— 6 段落组装器
+因为这样会有三个问题：
+
+### 1. 不好维护
+
+你很难知道：
+
+- 哪一段来自哪里
+- 该修改哪一部分
+- 哪一段是固定说明，哪一段是临时上下文
+
+### 2. 不好测试
+
+如果 system prompt 是一大坨文本，你很难分别测试：
+
+- 工具说明生成得对不对
+- memory 是否被正确拼进去
+- CLAUDE.md 是否被正确读取
+
+### 3. 不好做缓存和动态更新
+
+一些稳定内容其实不需要每轮大变。
+一些临时内容又只该活一轮。
+
+这就要求你把"稳定块"和"动态块"分开思考。
+
+## 最小实现结构
+
+### 第一步：做一个 builder
 
 ```java
 static class SystemPromptBuilder {
     public String build() {
         List<String> sections = new ArrayList<>();
+
         sections.add(_buildCore());           // 1. 身份和基本指令
         sections.add(_buildToolListing());    // 2. 可用工具列表
         sections.add(_buildSkillListing());   // 3. skills/ 下的技能元数据
@@ -43,115 +130,175 @@ static class SystemPromptBuilder {
         sections.add(_buildClaudeMd());       // 5. CLAUDE.md 指令链
         sections.add(DYNAMIC_BOUNDARY);       // 静态/动态分界
         sections.add(_buildDynamicContext()); // 6. 日期、平台、模型
-        return String.join("\n\n", sections);
+
+        return String.join("\n\n",
+            sections.stream().filter(s -> !s.isEmpty()).toList());
     }
 }
 ```
 
-### 段落 1：核心指令
+这就是这一章最核心的设计。
+
+### 第二步：每一段只负责一种来源
+
+例如：
+
+- `_buildToolListing()` 只负责把工具说明生成出来
+- `_buildMemorySection()` 只负责拿 memory
+- `_buildClaudeMd()` 只负责读指令文件
+
+这样每一段的职责就很清楚。
+
+## 关键的结构化边界
+
+### 边界 1：稳定说明 vs 动态提醒
+
+最重要的一组边界是：
+
+- 稳定的系统说明
+- 每轮临时变化的提醒
+
+这两类东西不应该混为一谈。
+
+### 边界 2：DYNAMIC_BOUNDARY
+
+在 `S10SystemPrompt.java` 中，用一个常量标记分界：
 
 ```java
-private String _buildCore() {
-    return "You are a coding agent operating in " + workdir + ".\n"
-         + "Use the provided tools to explore, read, write, and edit files.\n"
-         + "Always verify before assuming. Prefer reading files over guessing.";
-}
+private static final String DYNAMIC_BOUNDARY = "=== DYNAMIC_BOUNDARY ===";
 ```
 
-### 段落 2：工具清单
+它的作用不是神秘魔法。
 
-从工具定义中提取名称、参数和描述：
+它只是提醒你：
+
+**上面更稳定，下面更容易变。**
+
+教学版可以先这样分：
+
+```text
+静态部分：
+- core
+- tools
+- skills
+- memory
+- CLAUDE.md
+
+动态部分：
+- date
+- cwd
+- model
+- current mode
+```
+
+### 边界 3：system prompt vs system reminder
+
+system prompt 适合放：
+
+- 身份
+- 规则
+- 工具
+- 长期约束
+
+system reminder 适合放：
+
+- 这一轮才临时需要的补充上下文
+- 当前变动的状态
+
+所以更清晰的做法是：
+
+- 主 system prompt 保持相对稳定
+- 每轮额外变化的内容，用单独的 reminder 方式追加
+
+## CLAUDE.md为什么要单独一段
+
+因为它的角色不是"某一次任务的临时上下文"，而是更稳定的长期说明。
+
+教学仓里，最容易理解的链条是：
+
+1. 用户全局级：`~/.claude/CLAUDE.md`
+2. 项目根目录级：`<project>/CLAUDE.md`
+3. 当前子目录级：`<subdir>/CLAUDE.md`
+
+然后全部拼进去，而不是互相覆盖。
 
 ```java
-private String _buildToolListing() {
-    for (Tool tool : tools) {
-        lines.add("- " + tool.name() + "(" + params + "): " + desc);
-    }
-}
+// 用户全局指令
+Path userClaude = Path.of(System.getProperty("user.home"))
+    .resolve(".claude").resolve("CLAUDE.md");
+
+// 项目根目录
+Path projectClaude = workdir.resolve("CLAUDE.md");
+
+// 子目录（如果 cwd 与 workdir 不同）
+Path subdirClaude = cwd.resolve("CLAUDE.md");
 ```
 
-### 段落 3：技能元数据
+这样读者更容易理解"规则来源可以分层叠加"这个思想。
 
-扫描 `skills/` 目录下的 `SKILL.md` 文件，解析 frontmatter。
+## memory为什么要和system prompt有关系
 
-### 段落 4：记忆内容
+因为 memory 的本质是：
 
-扫描 `.memory/` 目录下的 `.md` 文件，注入持久记忆。
+**把跨会话仍然有价值的信息，重新带回模型当前的工作环境。**
 
-### 段落 5：CLAUDE.md 链
+如果保存了 memory，却从来不在系统输入中重新呈现，那它就等于没被真正用起来。
 
-按优先级加载所有 CLAUDE.md 文件（全部包含，不互斥）：
+所以 memory 最终一定要进入 prompt 组装链条。
 
-```
-~/.claude/CLAUDE.md         → 用户全局指令
-<project>/CLAUDE.md         → 项目根目录指令
-<subdir>/CLAUDE.md          → 子目录特定指令
-```
+在 `S10SystemPrompt.java` 中，段落 4 (`_buildMemorySection()`) 扫描 `.memory/` 目录下的 `.md` 文件，将持久记忆注入系统提示词。
 
-### 段落 6：动态上下文
+## 初学者最容易混淆的点
 
-```java
-private String _buildDynamicContext() {
-    lines.add("Current date: " + LocalDate.now());
-    lines.add("Working directory: " + workdir);
-    lines.add("Model: " + model);
-    lines.add("Platform: " + System.getProperty("os.name"));
-}
-```
+### 1. 把 system prompt 讲成一个固定字符串
 
-### 缓存优化
+这会让读者看不到系统是如何长大的。
 
-`DYNAMIC_BOUNDARY` 标记将稳定内容（段落 1-5）与动态内容（段落 6）分离。在生产环境中，稳定前缀可以跨轮次缓存以节省 prompt tokens。
+### 2. 把所有变化信息都塞进 system prompt
 
-## 关键代码片段
+这会把稳定说明和临时提醒搅在一起。
 
-每轮循环重建系统提示词：
+### 3. 把 CLAUDE.md、memory、skills 写成同一种东西
 
-```java
-while (true) {
-    // 每轮重建系统提示词
-    String system = promptBuilder.build();
-    paramsBuilder.system(system);
+它们都可能进入 prompt，但来源和职责不同：
 
-    Message response = client.messages().create(paramsBuilder.build());
-    // ...
-}
-```
+- `skills`：可选能力或知识包
+- `memory`：跨会话记住的信息
+- `CLAUDE.md`：长期规则说明
 
-REPL 命令检查提示词：
+## 教学边界
 
-```
-/prompt      # 显示完整组装的系统提示词
-/sections    # 只显示段落标题行
-```
+这一章先只建立一个核心心智：
 
-## 变更对比
+**prompt 不是一整块静态文本，而是一条被逐段组装出来的输入流水线。**
 
-| 组件          | S09             | S10                                  |
-|---------------|-----------------|--------------------------------------|
-| 系统提示词    | 动态（记忆注入）| 6 段落流水线组装                     |
-| 组装器        | buildSystemPrompt() | SystemPromptBuilder 内部类        |
-| CLAUDE.md     | （无）          | 用户全局 + 项目 + 子目录链           |
-| 工具清单      | （无）          | 自动从 Tool 定义提取                 |
-| 技能元数据    | （无）          | 扫描 skills/ 目录                    |
-| 缓存标记      | （无）          | DYNAMIC_BOUNDARY                     |
+所以这里先不要扩到太多外层细节：
 
-## 试一试
+- 不要先讲复杂的 section 注册系统
+- 不要先讲缓存与预算
+- 不要先讲所有外部能力如何追加 prompt 说明
 
-```sh
-cd mini-agent-4j
-mvn compile exec:java -Dexec.mainClass="com.example.agent.sessions.S10SystemPrompt"
-```
+只要读者已经能把稳定规则、动态提醒、memory、skills 这些来源看成不同输入段，而不是同一种"大 prompt"，这一章就已经讲到位了。
 
-1. 输入 `/sections` 查看提示词包含哪些段落
-2. 输入 `/prompt` 查看完整组装的提示词
-3. 创建一个 `CLAUDE.md` 文件，重新输入 `/prompt` 观察变化
-4. 在 `.memory/` 目录添加记忆文件，观察段落 4 出现
+## 这章和后续章节的关系
 
-## 要点总结
+这一章像一个汇合点：
 
-1. 系统提示词是 6 个独立段落的有序拼接，不是一个大字符串
-2. 每个段落职责单一：身份、工具、技能、记忆、指令链、动态上下文
-3. DYNAMIC_BOUNDARY 分离稳定内容和动态内容，为缓存优化提供基础
-4. CLAUDE.md 链让用户在不同层级（全局、项目、目录）定制行为
-5. 段落不存在时自动跳过（空字符串），不产生多余输出
+- `s05` skills 会汇进来
+- `s09` memory 会汇进来
+- `s07` 的当前模式也可能汇进来
+- `s19` MCP 以后也可能给 prompt 增加说明
+
+所以 `s10` 的价值不是"新加一个功能"，
+而是"把前面长出来的功能组织成一份清楚的系统输入"。
+
+## 学完这章后你应该能回答
+
+- 为什么 system prompt 不能只是一整块硬编码文本？
+- 为什么要把不同来源拆成独立 section？
+- system prompt 和 system reminder 的边界是什么？
+- memory、skills、CLAUDE.md 为什么都可能进入 prompt，但又不是一回事？
+
+---
+
+**一句话记住：system prompt 的关键不是"写一段很长的话"，而是"把不同来源的信息按清晰边界组装起来"。**

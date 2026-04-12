@@ -1,89 +1,130 @@
-# s19：MCP 插件系统
+# s19: MCP & Plugin System (MCP 与插件系统)
 
-`... s17 > s18 > s19 ...`
+`s00 > s01 > s02 > s03 > s04 > s05 > s06 > s07 > s08 > s09 > s10 > s11 > s12 > s13 > s14 > s15 > s16 > s17 > s18 > [ s19 ]`
 
-> *"外部工具应该进入同一个工具管线，而不是形成一个完全独立的世界。"* —— MCP 工具和原生工具共享权限检查和标准化输出。
+> *工具不必都写死在主程序里。外部进程也可以把能力接进你的 agent。*
 
-## 课程目标
+## 这一章到底在讲什么
 
-理解如何通过 MCP（Model Context Protocol）协议让外部进程暴露工具给 Agent 使用。MCP 工具与原生工具统一管理，经过同一个权限门控。
+前面所有章节里，工具基本都写在你自己的 Java 代码里。
 
-## 问题
+这当然是最适合教学的起点。
 
-Agent 的原生工具（bash、read、write、edit）覆盖了基本的文件操作，但团队可能有自定义的工具需求：数据库查询、API 测试、部署脚本。如果每种工具都硬编码进 Agent，代码会无限膨胀。需要一个插件机制让外部进程提供工具。
+但真实系统走到一定阶段以后，会很自然地遇到这个需求：
 
-## 方案
+> "能不能让外部程序也把工具接进来，而不用每次都改主程序？"
 
-最小路径：
+这就是 MCP 要解决的问题。
 
+## 先用最简单的话解释 MCP
+
+你可以先把 MCP 理解成：
+
+**一套让 agent 和外部工具程序对话的统一协议。**
+
+在教学版里，不必一开始就背很多协议细节。
+你只要先抓住这条主线：
+
+1. 启动一个外部工具服务进程
+2. 问它"你有哪些工具"
+3. 当模型要用它的工具时，把请求转发给它
+4. 再把结果带回 agent 主循环
+
+这已经够理解 80% 的核心机制了。
+
+## 为什么这一章放在最后
+
+因为 MCP 不是主循环的起点，而是主循环稳定之后的扩展层。
+
+如果你还没真正理解：
+
+- agent loop
+- tool call
+- permission
+- task
+- worktree
+
+那 MCP 只会看起来像又一套复杂接口。
+
+但当你已经有了前面的心智，再看 MCP，你会发现它本质上只是：
+
+**把"工具来源"从"本地硬编码"升级成"外部可插拔"。**
+
+## 建议联读
+
+- 如果你只把 MCP 理解成"远程 tools"，先看 [`s19a-mcp-capability-layers.md`](./s19a-mcp-capability-layers.md)，把 tools、resources、prompts、plugin 中介层一起放回平台边界里。
+- 如果你想确认外部能力为什么仍然要回到同一条执行面，回看 [`s02b-tool-execution-runtime.md`](./s02b-tool-execution-runtime.md)。
+- 如果你开始把"query 控制平面"和"外部能力路由"完全分开理解，建议配合看 [`s00a-query-control-plane.md`](./s00a-query-control-plane.md)。
+
+## 最小心智模型
+
+```text
+LLM
+  |
+  | asks to call a tool
+  v
+Agent tool router
+  |
+  +-- native tool  -> 本地 Java handler
+  |
+  +-- MCP tool     -> 外部 MCP server
+                        |
+                        v
+                    return result
 ```
-1. 启动 MCP 服务器进程（子进程，stdio 通信）
-2. 向它查询有哪些工具（tools/list）
-3. 加上 mcp__ 前缀并注册这些工具
-4. 将匹配的调用路由到对应服务器
-```
 
-架构：
+## 最小系统里最重要的三件事
 
-```
-+-------------------+     +------------------+
-| 原生工具           |     | MCP 服务器        |
-| bash, read_file,  |     | (外部进程)        |
-| write_file, etc.  |     |                  |
-+--------+----------+     +--------+---------+
-         |                         |
-         v                         v
-+--------+-------------------------+--------+
-|           统一工具池（buildToolPool）       |
-| 原生工具优先，MCP 工具加 mcp__ 前缀         |
-+-------------------+----------------------+
-                    |
-                    v
-+-------------------+----------------------+
-|         CapabilityPermissionGate          |
-| 原生和 MCP 工具都经过同一个权限门           |
-+-------------------+----------------------+
-                    |
-                    v
-+-------------------+----------------------+
-|         normalizeToolResult               |
-| 用 source/risk/status 元数据包装输出       |
-+-------------------------------------------+
-```
+### 1. 有一个 MCP client
 
-## 核心概念
+它负责：
 
-### MCPClient —— 最小 stdio 客户端
+- 启动外部进程
+- 发送请求
+- 接收响应
 
-使用 JSON-RPC 2.0 通过子进程的 stdin/stdout 通信：
+在 Java 版里，`MCPClient` 通过子进程的 stdin/stdout 用 JSON-RPC 2.0 通信：
 
 ```java
 static class MCPClient {
-    // 通信协议：
-    // 1. initialize（protocolVersion "2024-11-05"）
-    // 2. notifications/initialized（无 id）
-    // 3. tools/list → 获取工具列表
-    // 4. tools/call → 执行工具
-
-    boolean connect();              // 启动子进程 + initialize
-    List<Map<String, Object>> listTools();   // 获取工具列表
-    String callTool(String name, Map args);  // 执行工具
-    void disconnect();              // 关闭子进程
+    boolean connect();                            // 启动子进程 + initialize
+    List<Map<String, Object>> listTools();        // 获取工具列表
+    String callTool(String name, Map args);       // 执行工具
+    void disconnect();                            // 关闭子进程
 }
 ```
 
-JSON-RPC 消息格式：
+### 2. 有一个工具名前缀规则
 
-```json
-// 请求
-{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}
-// 响应
-{"jsonrpc":"2.0","id":1,"result":{"tools":[...]}}
+这是为了避免命名冲突。
+
+最常见的做法是：
+
+```text
+mcp__{server}__{tool}
 ```
 
-### MCPToolRouter —— 工具路由器
+比如：
 
-将 `mcp__{server}__{tool}` 前缀的工具调用路由到正确的 MCP 服务器：
+```text
+mcp__postgres__query
+mcp__browser__open_tab
+```
+
+这样一眼就知道：
+
+- 这是 MCP 工具
+- 它来自哪个 server
+- 它原始工具名是什么
+
+### 3. 有一个统一路由器
+
+路由器只做一件事：
+
+- 如果是本地工具，就交给本地 handler
+- 如果是 MCP 工具，就交给 MCP client
+
+Java 版的 `MCPToolRouter` 实现：
 
 ```java
 static class MCPToolRouter {
@@ -100,65 +141,214 @@ static class MCPToolRouter {
 }
 ```
 
-### CapabilityPermissionGate —— 共享权限门
+## Plugin 又是什么
 
-原生工具和 MCP 工具都经过同一个权限控制面：
+如果 MCP 解决的是"外部工具怎么通信"，
+那 plugin 解决的是"这些外部工具配置怎么被发现"。
 
-```java
-static class CapabilityPermissionGate {
-    Map<String, Object> normalize(String toolName, Map<String, Object> toolInput) {
-        // 解析 mcp__{server}__{tool} 格式
-        // 根据工具名判断风险等级：read / write / high
-    }
+最小 plugin 可以非常简单：
 
-    Map<String, Object> check(String toolName, Map<String, Object> toolInput) {
-        // read → 自动允许
-        // auto 模式下 write → 自动允许
-        // high → 需要确认
-        // 其他 write → 需要确认
-    }
-}
+```text
+.claude-plugin/
+  plugin.json
 ```
 
-风险等级：
+里面写：
 
-| 等级 | 工具前缀                          | 默认行为 |
-|------|-----------------------------------|----------|
-| read | read, list, get, show, search... | 自动允许 |
-| write | write, edit, bash（非危险命令）  | 需确认   |
-| high | delete, remove, sudo, rm -rf...  | 需确认   |
+- 插件名
+- 版本
+- 它提供哪些 MCP server
+- 每个 server 的启动命令是什么
 
-### PluginLoader —— 插件发现器
-
-从 `.claude-plugin/plugin.json` 清单文件发现 MCP 服务器配置：
+Java 版的 `PluginLoader` 负责扫描 `.claude-plugin/` 目录并加载清单：
 
 ```java
 static class PluginLoader {
-    List<String> scan();                           // 扫描 .claude-plugin/ 目录
-    Map<String, Map<String, Object>> getMcpServers(); // 提取 MCP 服务器配置
+    List<String> scan();                               // 扫描 .claude-plugin/ 目录
+    Map<String, Map<String, Object>> getMcpServers();  // 提取 MCP 服务器配置
 }
 ```
 
-### 工具结果标准化
+## 最小配置长什么样
 
-所有工具的输出都经过标准化，确保一致性：
+```json
+{
+  "name": "my-db-tools",
+  "version": "1.0.0",
+  "mcpServers": {
+    "postgres": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-postgres"]
+    }
+  }
+}
+```
+
+这个配置并不复杂。
+
+它本质上只是在告诉主程序：
+
+> "如果你想接这个 server，就用这条命令把它拉起来。"
+
+## 最小实现步骤
+
+### 第一步：写一个 `MCPClient`
+
+它至少要有三个能力：
+
+- `connect()`
+- `listTools()`
+- `callTool()`
+
+在 Java 里，通信协议遵循 JSON-RPC 2.0 over stdio：
+
+```json
+// 请求
+{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}
+// 响应
+{"jsonrpc":"2.0","id":1,"result":{"tools":[...]}}
+```
+
+初始化流程：先发 `initialize`（带 protocolVersion `"2024-11-05"`），再发 `notifications/initialized` 通知（无 id），之后才能调用 `tools/list` 和 `tools/call`。
+
+### 第二步：把外部工具标准化成 agent 能看懂的工具定义
+
+也就是说，把 MCP server 暴露的工具，转成 agent 工具池里的统一格式。
+
+Java 版通过 `defineMcpTool()` 把 MCP 工具的 `inputSchema` 转换为 Anthropic SDK 的 `Tool` 对象：
 
 ```java
-private static String normalizeToolResult(String toolName, String output, ...) {
+private static Tool defineMcpTool(String name, String description,
+                                  Map<String, Object> inputSchema) {
+    var schemaBuilder = Tool.InputSchema.builder();
+    Object propsObj = inputSchema.get("properties");
+    if (propsObj instanceof Map) {
+        schemaBuilder.properties(JsonValue.from(propsObj));
+    }
+    Object requiredObj = inputSchema.get("required");
+    if (requiredObj instanceof List) {
+        schemaBuilder.putAdditionalProperty("required", JsonValue.from(requiredObj));
+    }
+    return Tool.builder()
+            .name(name)
+            .description(description)
+            .inputSchema(schemaBuilder.build())
+            .build();
+}
+```
+
+### 第三步：加前缀
+
+这样主程序就能区分：
+
+- 本地工具
+- 外部工具
+
+`MCPClient.getAgentTools()` 在转换时自动加上 `mcp__{serverName}__{toolName}` 前缀。
+
+### 第四步：写一个 router
+
+```java
+if (mcpRouter.isMcpTool(toolName)) {
+    return mcpRouter.call(toolName, arguments);
+} else {
+    Function<Map<String, Object>, String> handler = NATIVE_HANDLERS.get(toolName);
+    return handler != null ? handler.apply(arguments) : "Unknown tool";
+}
+```
+
+### 第五步：仍然走同一条权限管道
+
+这是非常关键的一点：
+
+**MCP 工具虽然来自外部，但不能绕开 permission。**
+
+不然你等于在系统边上开了个安全后门。
+
+Java 版通过 `CapabilityPermissionGate` 实现统一权限控制，原生工具和 MCP 工具都先被标准化为能力意图，然后经过同一个 allow / ask 策略：
+
+```java
+// 风险等级判断
+if ("read_file".equals(actualTool) || startsWithAny(lowered, READ_PREFIXES)) {
+    risk = "read";       // 只读操作
+} else if ("bash".equals(actualTool)) {
+    risk = "high";        // bash 检查命令内容
+} else if (startsWithAny(lowered, HIGH_RISK_PREFIXES)) {
+    risk = "high";        // 高风险操作
+} else {
+    risk = "write";       // 状态变更操作
+}
+```
+
+风险等级映射表：
+
+| 等级  | 工具前缀                           | 默认行为 |
+|-------|------------------------------------|----------|
+| read  | read, list, get, show, search...   | 自动允许 |
+| write | write, edit, bash（非危险命令）    | 需确认   |
+| high  | delete, remove, sudo, rm -rf...    | 需确认   |
+
+结果也标准化回同一条总线：
+
+```java
+private static String normalizeToolResult(String toolName, String output,
+                                          Map<String, Object> intent) {
+    String status = output.contains("Error:") ? "error" : "ok";
+    String preview = output.length() > 500 ? output.substring(0, 500) : output;
+
     Map<String, Object> payload = new LinkedHashMap<>();
-    payload.put("source", intent.get("source"));  // "native" 或 "mcp"
-    payload.put("server", intent.get("server"));  // MCP 服务器名或 null
-    payload.put("tool", intent.get("tool"));
-    payload.put("risk", intent.get("risk"));
-    payload.put("status", ...);                    // "ok" 或 "error"
-    payload.put("preview", ...);                   // 前 500 字符
+    payload.put("source", intent.get("source"));   // "native" 或 "mcp"
+    payload.put("server", intent.get("server"));   // MCP 服务器名或 null
+    payload.put("tool",   intent.get("tool"));
+    payload.put("risk",   intent.get("risk"));
+    payload.put("status", status);
+    payload.put("preview", preview);
     return JSON_MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(payload);
 }
 ```
 
-## 关键代码片段
+这表示：
 
-工具池构建 —— 原生工具优先，MCP 工具加前缀：
+- 路由前要过共享权限闸门
+- 路由后不论本地还是远程，结果都要转成主循环看得懂的统一格式
+
+## 如何接到整个系统里
+
+如果你读到这里还觉得 MCP 像"外挂"，通常是因为没有把它放回整条主回路里。
+
+更完整的接法应该看成：
+
+```text
+启动时
+  ->
+PluginLoader 找到 manifest
+  ->
+得到 server 配置
+  ->
+MCP client 连接 server
+  ->
+listTools 并标准化名字
+  ->
+和 native tools 一起合并进同一个工具池
+
+运行时
+  ->
+LLM 产出 tool_use
+  ->
+统一权限闸门（CapabilityPermissionGate）
+  ->
+native route 或 mcp route
+  ->
+结果标准化（normalizeToolResult）
+  ->
+tool_result 回到同一个主循环
+```
+
+这段流程里最关键的不是"外部"两个字，而是：
+
+**进入方式不同，但进入后必须回到同一条控制面和执行面。**
+
+工具池构建时原生工具优先，确保核心功能可预测：
 
 ```java
 private static List<Tool> buildToolPool() {
@@ -177,6 +367,161 @@ private static List<Tool> buildToolPool() {
 }
 ```
 
+## Plugin、MCP Server、MCP Tool 不要混成一层
+
+这是初学者最容易在本章里打结的地方。
+
+可以直接按下面三层记：
+
+| 层级              | 它是什么                | 它负责什么                       |
+|-------------------|-------------------------|----------------------------------|
+| plugin manifest   | 一份配置声明            | 告诉系统要发现和启动哪些 server  |
+| MCP server        | 一个外部进程 / 连接对象 | 对外暴露一组能力                 |
+| MCP tool          | server 暴露的一项具体调用能力 | 真正被模型点名调用          |
+
+换成一句最短的话说：
+
+- plugin 负责"发现"
+- server 负责"连接"
+- tool 负责"调用"
+
+只要这三层还分得清，MCP 这章的主体心智就不会乱。
+
+## 这一章最关键的数据结构
+
+### 1. server 配置
+
+```java
+Map<String, Object> config = Map.of(
+    "command", "npx",
+    "args",    List.of("-y", "..."),
+    "env",     Map.of()
+);
+```
+
+### 2. 标准化后的工具定义
+
+```java
+Map<String, Object> agentTool = Map.of(
+    "name",        "mcp__postgres__query",
+    "description", "Run a SQL query",
+    "inputSchema", Map.of(...),
+    "_mcp_server", "postgres",
+    "_mcp_tool",   "query"
+);
+```
+
+### 3. client 注册表
+
+```java
+Map<String, MCPClient> clients = new LinkedHashMap<>();
+clients.put("postgres", mcpClientInstance);
+```
+
+## 初学者最容易被带偏的地方
+
+### 1. 一上来讲太多协议细节
+
+这章最容易失控。
+
+因为一旦开始讲完整协议生态，很快会出现：
+
+- transports
+- auth
+- resources
+- prompts
+- streaming
+- connection recovery
+
+这些都存在，但不该挡住主线。
+
+主线只有一句话：
+
+**外部工具也能像本地工具一样接进 agent。**
+
+### 2. 把 MCP 当成一套完全不同的工具系统
+
+不是。
+
+它最终仍然应该汇入你原来的工具体系：
+
+- 一样要注册
+- 一样要出现在工具池里
+- 一样要过权限
+- 一样要返回 `tool_result`
+
+### 3. 忽略命名与路由
+
+如果没有统一前缀和统一路由，系统会很快乱掉。
+
+## 教学边界
+
+这一章正文先停在 `tools-first` 是对的。
+
+因为教学主线最需要先讲清的是：
+
+- 外部能力怎样被发现
+- 怎样被统一命名和路由
+- 怎样继续经过同一条权限与 `tool_result` 回流
+
+只要这一层已经成立，读者就已经真正理解了：
+
+**MCP / plugin 不是外挂，而是接回同一控制面的外部能力入口。**
+
+transport、认证、resources、prompts、插件生命周期这些更大范围的内容，应该放到平台桥接资料里继续展开。
+
+## 正文先停在 tools-first，平台层再看桥接文档
+
+这一章的正文故意停在"外部工具如何接进 agent"这一层。
+这是教学上的刻意取舍，不是缺失。
+
+如果你准备继续补平台边界，再去看：
+
+- [`s19a-mcp-capability-layers.md`](./s19a-mcp-capability-layers.md)
+
+那篇会把 MCP 再往上补成一张平台地图，包括：
+
+- server 配置作用域
+- transport 类型
+- 连接状态：`connected / pending / needs-auth / failed / disabled`
+- tools 之外的 `resources / prompts / elicitation`
+- auth 该放在哪一层理解
+
+这样安排的好处是：
+
+- 正文不失焦
+- 读者又不会误以为 MCP 只有一个 `listTools + callTool`
+
+## 这一章和全仓库的关系
+
+如果说前 18 章都在教你把系统内部搭起来，
+那 `s19` 在教你：
+
+**如何把系统向外打开。**
+
+从这里开始，工具不再只来自你手写的 Java 文件，
+还可以来自别的进程、别的系统、别的服务。
+
+这就是为什么它适合作为最后一章。
+
+## 学完这章后，你应该能回答
+
+- MCP 的核心到底是什么？
+- 为什么它应该放在整个学习路径的最后？
+- 为什么 MCP 工具也必须走同一条权限与路由逻辑？
+- plugin 和 MCP 分别解决什么问题？
+
+---
+
+**一句话记住：MCP 的本质，不是协议名词堆砌，而是把外部工具安全、统一地接进你的 agent。**
+
+## 运行
+
+```sh
+cd mini-agent-4j
+mvn compile exec:java -Dexec.mainClass="com.example.agent.sessions.S19McpPlugin"
+```
+
 REPL 命令：
 
 ```
@@ -184,34 +529,13 @@ REPL 命令：
 /mcp      # 显示已连接的 MCP 服务器
 ```
 
-## 变更对比
+## 变更对比（S18 -> S19）
 
-| 组件          | S18           | S19                                  |
-|---------------|---------------|--------------------------------------|
-| MCP 客户端    | （无）        | MCPClient（JSON-RPC 2.0 over stdio） |
-| 工具路由      | 原生分发表    | MCPToolRouter + 原生分发表           |
-| 工具前缀      | （无）        | mcp__{server}__{tool}                |
-| 权限门控      | （无）        | CapabilityPermissionGate（共享）      |
-| 插件发现      | （无）        | PluginLoader（.claude-plugin/）      |
-| 结果标准化    | 原始输出      | normalizeToolResult（source/risk/status）|
-
-## 试一试
-
-```sh
-cd mini-agent-4j
-mvn compile exec:java -Dexec.mainClass="com.example.agent.sessions.S19McpPlugin"
-```
-
-1. 输入 `/tools` 查看所有可用工具
-2. 在 `.claude-plugin/plugin.json` 中配置一个 MCP 服务器
-3. 重启 Agent，输入 `/mcp` 查看已连接的服务器
-4. 让 Agent 使用 MCP 工具完成任务，观察权限提示
-
-## 要点总结
-
-1. MCP 是通过 JSON-RPC 2.0 over stdio 与子进程通信的协议
-2. MCP 工具以 `mcp__{server}__{tool}` 前缀与原生工具共存
-3. 原生工具在名称冲突时优先，确保核心功能可预测
-4. 所有工具（原生和 MCP）经过同一个权限门控，不做特殊化
-5. 工具结果标准化为统一格式（source/risk/status），便于日志和审计
-6. PluginLoader 从清单文件发现 MCP 服务器，实现即插即用
+| 组件          | S18           | S19                                          |
+|---------------|---------------|----------------------------------------------|
+| MCP 客户端    | （无）        | MCPClient（JSON-RPC 2.0 over stdio）         |
+| 工具路由      | 原生分发表    | MCPToolRouter + 原生分发表                   |
+| 工具前缀      | （无）        | mcp\_\_{server}\_\_{tool}                    |
+| 权限门控      | （无）        | CapabilityPermissionGate（共享）             |
+| 插件发现      | （无）        | PluginLoader（.claude-plugin/）              |
+| 结果标准化    | 原始输出      | normalizeToolResult（source/risk/status）    |

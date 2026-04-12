@@ -35,3 +35,14 @@ git submodule add https://github.com/shareAI-lab/learn-claude-code vendors/learn
 
 
 最终目的：将 @vendors/learn-claude-code 项目 重写成 java 版本的 @mini-agent-4j 项目，保持教学目的。带着这个目的，深入详细检视 @specs/implementation-plan.md 文档, 如果有任何不明确的地方，以提问的方式向我咨询，以获取更多明确、详细的信息。
+
+
+# 依赖升级
+
+深入分析论证将 @mini-agent-4j 项目中的 anthropic-java 依赖升级到 2.18.0 版本的可行性。
+要求：
+（1）技术上是否可行；
+（2）功能实现上能否和 @vendors/learn-claude-code/agent 保持一致。
+（3）这个项目的首要目的是教学。
+最终给我一份可行性分析结果。如果有任何不明确的地方，以提问的方式向我咨询，以获取更多明确、详细的信息。
+
