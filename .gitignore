@@ -92,3 +92,5 @@ vendors/
 .tasks/
 .team/
 .task_outputs/
+.memory/
+

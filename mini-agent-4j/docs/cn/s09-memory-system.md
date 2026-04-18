@@ -542,15 +542,96 @@ memory 很适合保存：
 
 ## 试一试
 
+### 启动
+
 ```sh
 cd mini-agent-4j
 mvn compile exec:java -Dexec.mainClass="com.example.agent.sessions.S09MemorySystem"
 ```
 
-1. 输入 `请记住：我喜欢使用 tabs 而非 spaces 进行缩进`
-2. 输入 `/memories` 查看已保存的记忆
-3. 检查 `.memory/` 目录下生成的文件
-4. 重启 Agent，观察记忆自动加载
+首次启动应显示 `[No existing memories. The agent can create them with save_memory.]`。
+
+### 案例 1：保存用户偏好（save_memory 触发）
+
+> 告诉 agent 一个偏好，观察它主动调用 save_memory 工具并落盘。
+
+```
+请记住：我喜欢使用 tabs 而非 spaces 进行缩进，tab 宽度设为 4
+```
+
+观察要点：
+- 模型判断这是一个值得保存的用户偏好，调用 `> save_memory:` 工具
+- 日志显示 `Saved memory 'prefer_tabs' [user] to .memory/prefer_tabs.md`
+- 检查 `.memory/` 目录：生成了 `prefer_tabs.md`（frontmatter 格式：name/description/type + 正文）
+- 同时生成了 `MEMORY.md` 索引文件，包含一行 `prefer_tabs: ... [user]`
+
+### 案例 2：/memories 命令 + 记忆召回
+
+> 用 /memories 验证记忆已保存，然后提问验证模型能从记忆中回答。
+
+先查看当前记忆：
+
+```
+/memories
+```
+
+观察要点：
+- 输出 `[user] prefer_tabs: 用户偏好使用 tabs 而非 spaces`（来自内存映射）
+- 这不需要调用 LLM，是 REPL 直接拦截的命令
+
+然后验证记忆是否被模型使用：
+
+```
+帮我创建一个新的 Java 配置文件
+```
+
+观察要点：
+- 模型在生成代码时使用 tabs 缩进（而非 spaces），说明记忆已注入系统提示词并生效
+- 系统提示词中包含 `# Memories (persistent across sessions)` 段落（动态重建机制）
+
+### 案例 3：多类型记忆保存
+
+> 分别保存 feedback、project、reference 三种类型的记忆，验证分类和索引。
+
+先保存一条反馈：
+
+```
+请记住：不要在测试中使用 mock，之前因为 mock 与真实实现不一致导致过生产事故
+```
+
+再保存一条项目事实：
+
+```
+请记住：legacy-auth 模块虽然代码老旧，但因为合规原因不能删除或大幅修改
+```
+
+最后保存一条外部资源指针：
+
+```
+请记住：团队的问题看板在 https://github.com/example/project/issues
+```
+
+观察要点：
+- 三次 save_memory 调用分别使用 `[feedback]`、`[project]`、`[reference]` 类型
+- 输入 `/memories` 可见 4 条记忆（含案例 1 的 prefer_tabs）
+- 打开 `MEMORY.md` 索引，验证所有 4 条记忆均按类型标注
+- 系统提示词中记忆按类型分组显示：`## [user]`、`## [feedback]`、`## [project]`、`## [reference]`
+
+### 案例 4：跨会话持久化验证
+
+> 重启 Agent，验证记忆自动加载并在新会话中立即可用。
+
+退出当前会话（输入 `q`），然后重新启动：
+
+```sh
+mvn compile exec:java -Dexec.mainClass="com.example.agent.sessions.S09MemorySystem"
+```
+
+观察要点：
+- 启动时显示 `[Memory loaded: 4 memories from .memory]` —— `loadAll()` 自动扫描并加载
+- 无需重新保存，输入 `/memories` 立刻可见全部 4 条记忆
+- 提问：`之前你说 legacy-auth 模块有什么注意事项？` —— 模型应从记忆中准确回忆合规约束
+- 这验证了"磁盘持久化 → 重启加载 → 系统提示词注入"的完整闭环
 
 ## 学完这章后，你应该能回答
 
