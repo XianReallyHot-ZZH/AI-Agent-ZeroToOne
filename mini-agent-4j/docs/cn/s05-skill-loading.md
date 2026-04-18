@@ -344,21 +344,120 @@ skill 解决的是"怎么做一类事"，memory 解决的是"记住长期事实"
 
 如果读者已经明白"为什么不能把所有 skill 永远塞进 system prompt，而应该先列目录、再按需加载"，这章就已经讲到位了。
 
-## 一句话记住
+## 试一试
 
-**Skill 系统的核心，不是"多一个工具"，而是"把可选知识从常驻 prompt 里拆出来，改成按需加载"。**
+### 准备技能文件
 
----
-
-**运行**
+先创建两个测试用的技能：
 
 ```sh
 cd mini-agent-4j
 mkdir -p skills/docker skills/testing
-# 先在每个目录下创建 SKILL.md 文件（含 YAML frontmatter）
+```
+
+创建 `skills/docker/SKILL.md`：
+
+```text
+---
+name: docker
+description: "Docker 容器化部署指南"
+---
+## Docker 部署步骤
+
+1. 在项目根目录创建 Dockerfile
+2. 使用多阶段构建减小镜像体积
+3. 设置 EXPOSE 端口
+4. 用 docker build -t <name> . 构建镜像
+5. 用 docker run -p <port>:<port> <name> 运行容器
+
+注意：不要用 latest 标签发布到生产；健康检查必须配置；环境变量不要硬编码。
+```
+
+创建 `skills/testing/SKILL.md`：
+
+```text
+---
+name: testing
+description: "Java 单元测试编写规范"
+---
+## 测试编写规范
+
+1. 测试类放在 src/test/java 下，包路径与被测类一致
+2. 测试方法命名：should_ExpectedBehavior_when_Condition
+3. 每个测试只验证一个行为
+4. 使用 AAA 模式：Arrange → Act → Assert
+5. 跑所有测试：mvn test
+
+注意：测试不能依赖执行顺序；外部依赖用 mock 隔离；边界值和异常路径必须覆盖。
+```
+
+### 启动
+
+```sh
 mvn compile exec:java -Dexec.mainClass="com.example.agent.sessions.S05SkillLoading"
 ```
 
-1. `加载 docker 技能，告诉我如何部署这个项目`
-2. `我需要写测试 -- 先加载 testing 技能`
-3. `你有哪些可用的技能？`
+启动时观察 dim 输出：`Loaded skills: docker, testing`（确认 Layer 1 目录已加载）。
+
+### 案例 1：查看可用技能（Layer 1 验证）
+
+> 只问"你有什么技能"，模型应该直接从 system prompt 中的目录回答，不调用 load_skill。
+
+```
+你有哪些可用的技能？
+```
+
+观察要点：
+- 模型是否直接列出技能名和描述（来自 system prompt 的 Layer 1 信息）
+- 日志中**不应该**出现 `> load_skill:` —— 说明模型没浪费 token 去加载完整正文
+- 这就是 Layer 1 的价值：便宜地让模型知道"有什么"
+
+### 案例 2：加载并使用技能（Layer 2 触发）
+
+> 提一个需要特定领域知识的任务，观察模型主动加载对应技能。
+
+```
+帮这个 Java 项目写一个 Dockerfile
+```
+
+观察要点：
+- 日志中出现 `> load_skill: <skill name="docker">` —— 模型判断需要 docker 知识，触发了 Layer 2
+- `load_skill` 返回的完整技能正文通过 `tool_result` 注入上下文，模型随后按照技能中的步骤工作
+- 对比案例 1：同样的 `load_skill` 工具，这次真的被调用了
+
+### 案例 3：不同任务加载不同技能（按需选择性）
+
+> 连续提两个不同领域的任务，观察模型每次只加载相关技能。
+
+```
+帮我给 S01TheAgentLoop.java 写一个单元测试
+```
+
+等它完成后，再问：
+
+```
+现在帮我把这个项目容器化
+```
+
+观察要点：
+- 第一个问题触发 `> load_skill: <skill name="testing">`（加载测试技能）
+- 第二个问题触发 `> load_skill: <skill name="docker">`（加载 Docker 技能）
+- 模型**不会**一次性加载两个技能 —— 这就是"按需"的含义
+- 两次 load_skill 之间，上下文中只包含当前任务需要的技能正文
+
+### 案例 4：请求不存在的技能（错误处理）
+
+> 故意让模型尝试加载一个不存在的技能。
+
+```
+加载 code-review 技能帮我审查代码
+```
+
+观察要点：
+- `load_skill` 返回类似 `Error: Unknown skill 'code-review'. Available skills: docker, testing`
+- 模型收到错误后如何恢复：是否告知用户该技能不可用，并建议用已有的技能代替
+- 这验证了 `loadFullText` 的错误路径：未知技能名 → 返回可用列表
+
+## 一句话记住
+
+**Skill 系统的核心，不是"多一个工具"，而是"把可选知识从常驻 prompt 里拆出来，改成按需加载"。**
