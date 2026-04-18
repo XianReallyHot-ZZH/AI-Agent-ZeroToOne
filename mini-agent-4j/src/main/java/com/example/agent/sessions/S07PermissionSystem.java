@@ -515,6 +515,9 @@ public class S07PermissionSystem {
 
         // 如果设置了自定义 baseUrl，清除 auth token 避免冲突
         String baseUrl = dotenv.get("ANTHROPIC_BASE_URL");
+        if (baseUrl != null && !baseUrl.isBlank()) {
+            System.clearProperty("ANTHROPIC_AUTH_TOKEN");
+        }
         String apiKey = dotenv.get("ANTHROPIC_API_KEY");
         if (apiKey == null || apiKey.isBlank()) {
             throw new IllegalStateException(
@@ -611,6 +614,22 @@ public class S07PermissionSystem {
             throw new SecurityException("Path escapes workspace: " + relativePath);
         }
         return resolved;
+    }
+
+    /**
+     * 检查工作区是否被标记为受信任。
+     * <p>
+     * 对应 Python 原版：is_workspace_trusted(workspace)。
+     * 通过检查 .miniclaude/.claude_trusted 标记文件判断工作区是否已被用户明确信任。
+     * 教学版本使用简单的标记文件机制，更完整的系统可在此基础上叠加更丰富的信任流程。
+     *
+     * @param workspace 工作区路径，null 时使用 WORK_DIR
+     * @return true 表示工作区已被标记为受信任
+     */
+    private static boolean isWorkspaceTrusted(Path workspace) {
+        Path ws = workspace != null ? workspace : WORK_DIR;
+        Path trustMarker = ws.resolve(".miniclaude").resolve(".claude_trusted");
+        return Files.exists(trustMarker);
     }
 
     // ==================== 工具实现 ====================

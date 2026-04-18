@@ -297,11 +297,123 @@ cd mini-agent-4j
 mvn compile exec:java -Dexec.mainClass="com.example.agent.sessions.S07PermissionSystem"
 ```
 
-1. 选择 `plan` 模式，然后尝试"在当前目录创建一个新文件"
-2. 选择 `default` 模式，然后执行 `ls` 和"写入文件"，观察权限提示差异
-3. 输入 `/mode auto`，再执行同样的写操作，对比行为变化
-4. 执行"删除所有文件"，观察危险命令拦截
+### 案例 1：plan 模式 —— 只读保护
 
----
+> 启动时选择 plan 模式，验证所有写操作被自动拒绝。
 
-**一句话记住：权限系统不是为了让 agent 更笨，而是为了让 agent 的行动先经过一道可靠的安全判断。**
+启动时输入 `plan`，然后：
+
+```
+帮我看看 pom.xml 里用了哪些依赖
+```
+
+观察要点：
+- read_file 被自动允许（plan 模式下只读工具直接放行）
+- 无权限提示弹窗
+
+接着试写操作：
+
+```
+在当前目录创建一个 hello.txt，内容是 "hello world"
+```
+
+观察要点：
+- 日志出现红色 `[DENIED] write_file: Plan mode: write operations are blocked`
+- write_file 和 edit_file 在 plan 模式下一律拒绝，模型收到拒绝消息后会调整策略
+- bash 也会被拒绝（属于 WRITE_TOOLS）
+
+### 案例 2：default 模式 —— 交互式审批
+
+> 使用 default 模式，观察不同工具的权限提示行为。
+
+启动时输入 `default`（或直接回车），然后：
+
+```
+帮我列出当前目录下的文件
+```
+
+观察要点：
+- bash 工具触发 `[Permission] bash: {command=dir}` 提示
+- 输入 `y` 允许执行，输入 `n` 拒绝
+- read_file 不会弹提示（被默认 allow 规则覆盖）
+
+试 `always` 回答：
+
+```
+帮我看看 README.md
+```
+
+再执行另一个 bash 命令时输入 `always`：
+
+```
+当前时间是什么
+```
+
+观察要点：
+- 输入 `always` 后，该工具的 allow 规则被永久添加
+- 后续同工具调用不再询问（输入 `/rules` 可确认新规则已添加）
+
+### 案例 3：运行时切换模式
+
+> 在 REPL 中用 `/mode` 命令动态切换，验证模式立即生效。
+
+先用 plan 模式启动，然后：
+
+```
+读取 pom.xml
+```
+
+确认只读操作正常后，切换模式：
+
+```
+/mode auto
+```
+
+再执行一个写操作：
+
+```
+帮我创建一个 temp_test.txt 文件
+```
+
+观察要点：
+- `/mode auto` 立即生效，打印绿色 `[Switched to auto mode]`
+- auto 模式下 read_file 自动批准，write_file 仍然询问用户
+- 用 `/rules` 查看当前规则列表
+
+### 案例 4：危险命令拦截（BashSecurityValidator）
+
+> 尝试执行包含危险模式的命令，观察 BashSecurityValidator 的分层拦截。
+
+用 default 模式启动，然后：
+
+```
+帮我用 sudo 执行系统更新
+```
+
+观察要点：
+- sudo 被 `BashSecurityValidator` 检测为 SEVERE 模式，**直接拒绝**（不询问用户）
+- 日志显示 `[DENIED] bash: Bash validator: Security flags: sudo (pattern: \bsudo\b)`
+
+再试非严重但有风险的命令：
+
+```
+运行命令 echo hello && echo world
+```
+
+观察要点：
+- `&&` 触发 shell_metachar 校验（非 SEVERE 模式）
+- 行为是 `ask` 而非 `deny` —— 用户仍可手动批准
+- 这体现了分层安全：严重模式强制拒绝，风险模式交由用户决定
+
+用 `/rules` 查看所有规则，输入 `/mode plan` 可随时回到安全模式。
+
+## 学完这章后，你应该能回答
+
+- 为什么权限系统不是一个简单开关？
+- 为什么 deny 要先于 allow？
+- 为什么要先做 3 个模式，而不是一上来做很复杂？
+- 为什么 bash 要被特殊对待？
+
+## 一句话记住
+
+**权限系统不是为了让 agent 更笨，而是为了让 agent 的行动先经过一道可靠的安全判断。**
