@@ -91,3 +91,4 @@ vendors/
 .transcripts/
 .tasks/
 .team/
+.task_outputs/

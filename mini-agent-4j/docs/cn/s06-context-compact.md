@@ -382,19 +382,94 @@ memory 解决的是：
 
 Java 版有意跳过 microCompact，这是与 Python 版的一个差异，但不影响核心心智模型的建立。
 
-## 一句话记住
-
-**上下文压缩的核心，不是尽量少字，而是让模型在更短的活跃上下文里，仍然保住继续工作的连续性。**
-
----
-
-**运行**
+## 试一试
 
 ```sh
 cd mini-agent-4j
 mvn compile exec:java -Dexec.mainClass="com.example.agent.sessions.S06ContextCompact"
 ```
 
-1. `读取 src/main/java 下所有 Java 文件并摘要项目`（生成大量上下文）
-2. `现在用 compact 工具压缩对话`
-3. `压缩后你还记得项目的哪些内容？`
+启动时注意 dim 输出：`Auto-compact threshold: 12000 tokens (~48.0 KB)` 和 `Large output persist threshold: 29.3 KB`。
+
+### 案例 1：大输出持久化（Layer 1 验证）
+
+> 执行一个会产生大量输出的命令，观察自动持久化到磁盘的机制。
+
+```
+运行命令 dir /s /b src 并告诉我项目里有多少个 Java 文件
+```
+
+观察要点：
+- 如果输出超过 30000 字符，日志中会出现 `<persisted-output>` 标记
+- 持久化文件保存在 `.task_outputs/tool-results/` 目录下，文件名是真实的 tool_use_id（而非 "unknown"）
+- 模型只看到预览 + 文件路径，仍然能基于预览回答你的问题
+
+### 案例 2：手动触发 compact（Layer 3 验证）
+
+> 先做几轮操作积累上下文，然后手动触发压缩，验证摘要保留了关键信息。
+
+先积累上下文：
+```
+读取 pom.xml，告诉我这个项目用了哪些依赖
+```
+
+等它回答后，再问：
+```
+再看看 README.md 的前 20 行
+```
+
+然后手动触发压缩：
+```
+用 compact 工具压缩对话，focus 设为"依赖和项目描述"
+```
+
+观察要点：
+- 日志出现 `> compact: Compressing...` 然后 `[manual compact]`
+- 出现 `[transcript saved: .transcripts/transcript_xxx.jsonl]` —— 完整对话已备份
+- 出现 `[auto-compact completed]` —— 摘要已生成并替换了对话历史
+- 压缩后追问：`刚才看到的依赖有哪些？` —— 模型应该能从摘要中回忆
+
+### 案例 3：自动触发 auto-compact（阈值触发）
+
+> 用一个足够长的任务让 token 估算超过 12000 阈值，观察自动压缩。
+
+```
+依次读取 src/main/java/com/example/agent/sessions/ 下每个 Java 文件的前 50 行，帮我统计每个 Session 大概实现了什么功能
+```
+
+观察要点：
+- 前几次 read_file 正常执行，tokenEstimate 持续累加
+- 当估算值超过阈值时，日志自动出现 `[auto compact: estimated XX KB, threshold 48.0 KB]`
+- 无需用户或模型主动触发 —— 系统自动判断并压缩
+- 压缩后 agent 继续工作，不会丢失"已读了哪些文件"的上下文（因为 recentFiles 会被附加到摘要中）
+
+### 案例 4：压缩后连续性验证（recentFiles 追踪）
+
+> 压缩后验证模型是否还记得最近操作过的文件，测试 CompactState 的 recentFiles 机制。
+
+先读几个文件：
+```
+帮我读一下 S01TheAgentLoop.java 的前 30 行
+```
+
+```
+再读一下 S02ToolUse.java 的前 30 行
+```
+
+```
+用 compact 压缩对话
+```
+
+压缩后问：
+```
+刚才我让你读了哪两个文件？帮我把它们列出来
+```
+
+观察要点：
+- compact 后的摘要末尾应该包含 `Recent files to reopen if needed:` 列表（这是新增的 recentFiles 追踪）
+- 模型应该能准确说出刚才读过的文件名
+- 如果没有 recentFiles 追踪，压缩后模型可能完全忘记读过哪些文件
+
+## 一句话记住
+
+**上下文压缩的核心，不是尽量少字，而是让模型在更短的活跃上下文里，仍然保住继续工作的连续性。**
