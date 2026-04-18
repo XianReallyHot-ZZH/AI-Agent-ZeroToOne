@@ -108,6 +108,110 @@ public class S04Subagent {
     private static String cyan(String text) { return ansi(ANSI_CYAN, text); }
     private static String red(String text)  { return ansi(ANSI_RED, text); }
 
+    // ==================== Agent 定义文件解析器 ====================
+
+    /**
+     * Agent 定义文件解析器（对应 Python 原版的 AgentTemplate 类）。
+     * <p>
+     * 真实 Claude Code 从 .claude/agents/*.md 加载 Agent 定义，
+     * 支持 YAML frontmatter 定义 Agent 的各种配置。
+     * <p>
+     * Frontmatter 支持的字段示例：
+     * <pre>
+     * ---
+     * name: code-reviewer
+     * tools: bash, read_file, edit_file
+     * disallowedTools: write_file
+     * model: claude-sonnet-4-20250514
+     * maxTurns: 20
+     * ---
+     * You are a code reviewer agent...
+     * </pre>
+     * <p>
+     * Frontmatter 字段说明（对应真实 Claude Code）：
+     * name, tools, disallowedTools, skills, hooks, model, effort,
+     * permissionMode, maxTurns, memory, isolation, color,
+     * background, initialPrompt, mcpServers。
+     * <p>
+     * 3 种来源：内置 Agent、自定义（.claude/agents/）、插件提供。
+     * <p>
+     * 对应 Python 原版：AgentTemplate 类。
+     */
+    static class AgentTemplate {
+        /** 定义文件路径 */
+        final Path path;
+        /** Agent 名称（优先取 frontmatter 中的 name，否则取文件名） */
+        String name;
+        /** Frontmatter 中解析出的配置键值对 */
+        final Map<String, String> config = new LinkedHashMap<>();
+        /** Agent 系统提示词（frontmatter 之后的正文部分） */
+        String systemPrompt = "";
+
+        /**
+         * 从文件路径构造并解析 Agent 定义。
+         *
+         * @param pathStr Agent 定义文件的路径字符串
+         */
+        AgentTemplate(String pathStr) {
+            this.path = Path.of(pathStr).toAbsolutePath().normalize();
+            // 默认名称取文件名（去除扩展名），对应 Python 的 self.path.stem
+            String fileName = this.path.getFileName().toString();
+            this.name = fileName.contains(".")
+                    ? fileName.substring(0, fileName.lastIndexOf('.'))
+                    : fileName;
+            parse();
+        }
+
+        /**
+         * 解析 Markdown 文件中的 YAML frontmatter。
+         * <p>
+         * 对应 Python 原版的 _parse() 方法。
+         * 格式：以 --- 包裹的头部键值对 + 正文。
+         * 如果没有 frontmatter，整个文件内容作为 system_prompt。
+         */
+        private void parse() {
+            String text;
+            try {
+                text = Files.readString(path);
+            } catch (Exception e) {
+                systemPrompt = "";
+                return;
+            }
+
+            // 匹配 YAML frontmatter：---\n...\n---\n<body>
+            // 对应 Python：re.match(r"^---\s*\n(.*?)\n---\s*\n(.*)", text, re.DOTALL)
+            java.util.regex.Matcher matcher = java.util.regex.Pattern
+                    .compile("^---\\s*\\n(.*?)\\n---\\s*\\n(.*)", java.util.regex.Pattern.DOTALL)
+                    .matcher(text);
+
+            if (!matcher.find()) {
+                // 无 frontmatter，整个文件内容作为系统提示词
+                systemPrompt = text.strip();
+                return;
+            }
+
+            // 解析 frontmatter 中的 key: value 对
+            // 对应 Python：for line in match.group(1).splitlines()
+            for (String line : matcher.group(1).split("\\R")) {
+                int colonIdx = line.indexOf(':');
+                if (colonIdx > 0) {
+                    String key = line.substring(0, colonIdx).strip();
+                    String value = line.substring(colonIdx + 1).strip();
+                    config.put(key, value);
+                }
+            }
+
+            // 正文部分作为系统提示词
+            systemPrompt = matcher.group(2).strip();
+
+            // 优先使用 frontmatter 中的 name 字段
+            // 对应 Python：self.name = self.config.get("name", self.name)
+            if (config.containsKey("name")) {
+                name = config.get("name");
+            }
+        }
+    }
+
     // ==================== 环境变量 & 客户端构建 ====================
 
     /**
@@ -130,6 +234,11 @@ public class S04Subagent {
         Dotenv dotenv = loadDotenv();
 
         String baseUrl = dotenv.get("ANTHROPIC_BASE_URL");
+        // 对应 Python 原版：使用自定义 base_url 时清除 AUTH_TOKEN，
+        // 避免 SDK 优先使用 auth token 而非显式传入的 api key
+        if (baseUrl != null && !baseUrl.isBlank()) {
+            System.clearProperty("ANTHROPIC_AUTH_TOKEN");
+        }
         String apiKey = dotenv.get("ANTHROPIC_API_KEY");
         if (apiKey == null || apiKey.isBlank()) {
             throw new IllegalStateException(
