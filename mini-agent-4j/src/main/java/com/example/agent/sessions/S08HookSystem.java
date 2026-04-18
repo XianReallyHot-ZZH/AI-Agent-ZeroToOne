@@ -152,6 +152,8 @@ public class S08HookSystem {
         }
 
         if (baseUrl != null && !baseUrl.isBlank()) {
+            // 与 Python 原版对齐：自定义 baseUrl 时清除 ANTHROPIC_AUTH_TOKEN 避免冲突
+            System.clearProperty("ANTHROPIC_AUTH_TOKEN");
             return AnthropicOkHttpClient.builder()
                     .apiKey(apiKey)
                     .baseUrl(baseUrl)

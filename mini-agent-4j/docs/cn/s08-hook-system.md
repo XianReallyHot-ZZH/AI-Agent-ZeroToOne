@@ -359,15 +359,183 @@ for (String msg : postResult.messages) {
 
 ## 试一试
 
+### 准备 Hook 脚本和配置
+
+先创建 Hook 脚本目录和信任标记（Hook 只在受信任的工作区中运行）：
+
 ```sh
 cd mini-agent-4j
+mkdir -p hooks .claude
+```
+
+创建 `.claude/.claude_trusted` 空文件（工作区信任标记）。
+
+创建 `hooks/block_sudo.py` —— PreToolUse 拦截脚本（退出码 1 阻断）：
+
+```python
+import os, sys, json
+input_json = json.loads(os.environ.get("HOOK_TOOL_INPUT", "{}"))
+command = input_json.get("command", "")
+if "sudo" in command:
+    print(f"Blocked: sudo detected in: {command}", file=sys.stderr)
+    sys.exit(1)
+```
+
+创建 `hooks/audit_log.py` —— PostToolUse 注入脚本（退出码 2 注入消息）：
+
+```python
+import os, sys
+tool_name = os.environ.get("HOOK_TOOL_NAME", "")
+output = os.environ.get("HOOK_TOOL_OUTPUT", "")[:100]
+print(f"[Audit] {tool_name} executed. Preview: {output}", file=sys.stderr)
+sys.exit(2)
+```
+
+创建 `hooks/add_limit.py` —— PreToolUse 修改输入脚本（退出码 0 + JSON stdout）：
+
+```python
+import os, sys, json
+input_json = json.loads(os.environ.get("HOOK_TOOL_INPUT", "{}"))
+input_json["limit"] = 5
+print(json.dumps({"updatedInput": input_json}))
+sys.exit(0)
+```
+
+### 启动
+
+```sh
 mvn compile exec:java -Dexec.mainClass="com.example.agent.sessions.S08HookSystem"
 ```
 
-1. 创建 `.hooks.json` 文件，配置一个 PreToolUse Hook 拦截所有 bash 命令
-2. 在 Agent 中执行"列出当前目录的文件"，观察 Hook 触发
-3. 修改 Hook 返回退出码 1，观察工具被阻断
-4. 创建一个 PostToolUse Hook，在每次工具执行后注入额外提示
+### 案例 1：PreToolUse 拦截（退出码 1）
+
+> 配置一个 PreToolUse Hook 拦截包含 sudo 的 bash 命令，验证阻断机制。
+
+创建 `.hooks.json`：
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {"matcher": "bash", "command": "python hooks/block_sudo.py"}
+    ]
+  }
+}
+```
+
+启动后执行：
+
+```
+帮我用 sudo 执行系统更新
+```
+
+观察要点：
+- 日志出现 `[hook:PreToolUse] BLOCKED: Blocked: sudo detected in: sudo ...`
+- 工具被阻断，模型收到 `Tool blocked by PreToolUse hook` 消息后调整策略
+- matcher 为 `"bash"` —— 只对 bash 工具生效，read_file 等不触发此 Hook
+
+再试一个正常命令：
+
+```
+列出当前目录下的文件
+```
+
+观察要点：
+- bash 工具正常执行（不含 sudo，Hook 未拦截）
+- 退出码 0（无输出）时 Hook 静默通过
+
+### 案例 2：PostToolUse 注入补充信息（退出码 2）
+
+> 添加 PostToolUse Hook，在工具执行后向模型注入审计信息。
+
+更新 `.hooks.json`：
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {"matcher": "bash", "command": "python hooks/block_sudo.py"}
+    ],
+    "PostToolUse": [
+      {"matcher": "*", "command": "python hooks/audit_log.py"}
+    ]
+  }
+}
+```
+
+重启后执行：
+
+```
+帮我看看 pom.xml 的前 20 行
+```
+
+观察要点：
+- `read_file` 执行后，PostToolUse Hook 触发
+- 日志出现 `[hook:PostToolUse] INJECT: [Audit] read_file executed...`
+- 模型收到的工具结果末尾追加了 `[Hook note]: [Audit] read_file executed...`
+- matcher 为 `"*"` 表示匹配所有工具
+
+### 案例 3：PreToolUse 修改工具输入（退出码 0 + JSON）
+
+> 配置 PreToolUse Hook 通过 JSON stdout 静默修改工具输入参数。
+
+更新 `.hooks.json`：
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {"matcher": "bash", "command": "python hooks/block_sudo.py"},
+      {"matcher": "read_file", "command": "python hooks/add_limit.py"}
+    ],
+    "PostToolUse": [
+      {"matcher": "*", "command": "python hooks/audit_log.py"}
+    ]
+  }
+}
+```
+
+重启后执行：
+
+```
+帮我读取 README.md 的全部内容
+```
+
+观察要点：
+- PreToolUse Hook 拦截 read_file，输出 `{"updatedInput": {"path": "README.md", "limit": 5}}`
+- 日志出现 `[hook:PreToolUse] {"updatedInput": ...}` —— 退出码 0 + JSON stdout 的静默修改
+- 模型实际只收到前 5 行内容（尽管用户要求读取全部，Hook 强制加了 limit）
+- 这就是退出码 0 的"不改流程，但改参数"能力
+
+### 案例 4：SessionStart + 多 Hook 协作
+
+> 添加 SessionStart Hook 验证启动触发；同时观察三种 Hook 事件的完整协作链。
+
+更新 `.hooks.json`：
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {"matcher": "bash", "command": "python hooks/block_sudo.py"},
+      {"matcher": "read_file", "command": "python hooks/add_limit.py"}
+    ],
+    "PostToolUse": [
+      {"matcher": "*", "command": "python hooks/audit_log.py"}
+    ],
+    "SessionStart": [
+      {"matcher": "*", "command": "python -c \"import sys; print('Session initialized'); sys.exit(0)\""}
+    ]
+  }
+}
+```
+
+重启后观察：
+
+观察要点：
+- 启动时（进入 REPL 前）日志出现 `[hook:SessionStart] Session initialized` —— 无需用户输入
+- 执行任意工具，观察完整协作链：PreToolUse 检查/修改 → 工具执行 → PostToolUse 审计注入
+- 删除 `.claude/.claude_trusted` 后重启，所有 Hook 不再执行（工作区信任门控生效）
 
 ---
 
