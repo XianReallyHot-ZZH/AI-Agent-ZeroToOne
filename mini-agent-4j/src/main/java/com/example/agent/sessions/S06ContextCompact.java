@@ -147,6 +147,10 @@ public class S06ContextCompact {
         Dotenv dotenv = loadDotenv();
 
         String baseUrl = dotenv.get("ANTHROPIC_BASE_URL");
+        // 对应 Python 原版：使用自定义 base_url 时清除 AUTH_TOKEN
+        if (baseUrl != null && !baseUrl.isBlank()) {
+            System.clearProperty("ANTHROPIC_AUTH_TOKEN");
+        }
         String apiKey = dotenv.get("ANTHROPIC_API_KEY");
         if (apiKey == null || apiKey.isBlank()) {
             throw new IllegalStateException(
@@ -418,6 +422,45 @@ public class S06ContextCompact {
                 + "</persisted-output>";
     }
 
+    // ==================== 压缩状态 ====================
+
+    /**
+     * 上下文压缩状态（对应 Python 原版的 CompactState dataclass）。
+     * <p>
+     * 维护三个状态字段：
+     * - hasCompacted: 是否已经执行过压缩
+     * - lastSummary: 最近一次压缩的摘要文本
+     * - recentFiles: 最近读过的文件列表（最多 5 个）
+     * <p>
+     * 对应 Python 原版：
+     * <pre>
+     * @dataclass
+     * class CompactState:
+     *     has_compacted: bool = False
+     *     last_summary: str = ""
+     *     recent_files: list[str] = field(default_factory=list)
+     * </pre>
+     */
+    static class CompactState {
+        boolean hasCompacted = false;
+        String lastSummary = "";
+        final List<String> recentFiles = new ArrayList<>();
+    }
+
+    /**
+     * 追踪最近读过的文件（对应 Python 原版的 track_recent_file）。
+     * <p>
+     * 维护一个最多 5 个文件的列表，用于压缩时保留"最近打开的文件"信息。
+     * 如果同一个文件被重复读取，会先移除再重新添加到末尾。
+     */
+    private static void trackRecentFile(CompactState state, String path) {
+        state.recentFiles.remove(path);
+        state.recentFiles.add(path);
+        while (state.recentFiles.size() > 5) {
+            state.recentFiles.remove(0);
+        }
+    }
+
     // ==================== Layer 3: 上下文压缩（auto + manual） ====================
 
     /**
@@ -562,6 +605,7 @@ public class S06ContextCompact {
             String systemPrompt, List<Tool> tools,
             List<String> conversationLog,
             long[] tokenEstimate,
+            CompactState compactState,
             String focus) {
 
         // ---- 1. 保存 transcript ----
@@ -574,6 +618,16 @@ public class S06ContextCompact {
         // 追加用户指定的关注点
         if (focus != null && !focus.isBlank()) {
             summary += "\n\nFocus to preserve next: " + focus;
+        }
+
+        // 对应 Python：if state.recent_files: ...
+        if (!compactState.recentFiles.isEmpty()) {
+            StringBuilder recentLines = new StringBuilder();
+            for (String p : compactState.recentFiles) {
+                recentLines.append("- ").append(p).append("\n");
+            }
+            summary += "\n\nRecent files to reopen if needed:\n"
+                    + recentLines.toString().stripTrailing();
         }
 
         // ---- 3. 重建 paramsBuilder ----
@@ -599,6 +653,10 @@ public class S06ContextCompact {
         tokenEstimate[0] = compactedMessage.length() / 4;
         conversationLog.clear();
         conversationLog.add("[compacted] " + summary);
+
+        // 对应 Python：state.has_compacted / state.last_summary
+        compactState.hasCompacted = true;
+        compactState.lastSummary = summary;
 
         System.out.println(dim("[auto-compact completed]"));
         return newBuilder;
@@ -714,7 +772,8 @@ public class S06ContextCompact {
             String systemPrompt, List<Tool> tools,
             Map<String, Function<Map<String, Object>, String>> toolHandlers,
             List<String> conversationLog,
-            long[] tokenEstimate) {
+            long[] tokenEstimate,
+            CompactState compactState) {
 
         while (true) {
             // ---- Layer 2: Auto-compact 检查 ----
@@ -726,7 +785,7 @@ public class S06ContextCompact {
                 paramsHolder[0] = autoCompact(
                         client, model, paramsHolder[0],
                         systemPrompt, tools, conversationLog,
-                        tokenEstimate, null);
+                        tokenEstimate, compactState, null);
             }
 
             // ---- 调用 LLM ----
@@ -776,18 +835,34 @@ public class S06ContextCompact {
                     System.out.println(bold("> compact") + ": "
                             + dim("Compressing..."));
                 } else {
-                    // ---- 普通工具分发 ----
-                    Function<Map<String, Object>, String> handler = toolHandlers.get(toolName);
-                    if (handler != null) {
-                        output = handler.apply(input);
+                    // ---- 非 compact 工具：bash 和 read_file 需要真实 toolUseId ----
+                    if ("bash".equals(toolName)) {
+                        String command = (String) input.get("command");
+                        output = (command == null || command.isBlank())
+                                ? "Error: command is required"
+                                : runBash(command, toolUse.id());
+                    } else if ("read_file".equals(toolName)) {
+                        String path = (String) input.get("path");
+                        if (path == null || path.isBlank()) {
+                            output = "Error: path is required";
+                        } else {
+                            Integer limit = input.get("limit") instanceof Number n ? n.intValue() : null;
+                            trackRecentFile(compactState, path);
+                            output = runRead(path, limit, toolUse.id());
+                        }
                     } else {
-                        output = "Unknown tool: " + toolName;
+                        Function<Map<String, Object>, String> handler = toolHandlers.get(toolName);
+                        if (handler != null) {
+                            output = handler.apply(input);
+                        } else {
+                            output = "Unknown tool: " + toolName;
+                        }
                     }
 
+                    // 统一的日志和 token 估算（所有非 compact 工具共享）
                     System.out.println(bold("> " + toolName) + ": "
                             + dim(output.substring(0, Math.min(output.length(), PREVIEW_LEN))));
 
-                    // 累加 token 估算（工具输出）
                     tokenEstimate[0] += output.length() / 4;
                     conversationLog.add("tool(" + toolName + "): "
                             + output.substring(0, Math.min(output.length(), PREVIEW_LEN)));
@@ -810,7 +885,7 @@ public class S06ContextCompact {
                 paramsHolder[0] = autoCompact(
                         client, model, paramsHolder[0],
                         systemPrompt, tools, conversationLog,
-                        tokenEstimate, compactFocus);
+                        tokenEstimate, compactState, compactFocus);
             }
         }
     }
@@ -904,29 +979,8 @@ public class S06ContextCompact {
         );
 
         // ---- 工具分发表 ----
-        // compact 不在这里分发，由 agentLoop 内联拦截
+        // compact、bash、read_file 由 agentLoop 内联处理（需要 toolUseId 或 state）
         Map<String, Function<Map<String, Object>, String>> toolHandlers = new LinkedHashMap<>();
-
-        // bash 工具：需要传入 toolUseId 用于大输出持久化
-        // 但分发表签名只接受 Map，所以我们通过 ThreadLocal 传递 toolUseId
-        // 更简单的做法：直接在 agentLoop 中特殊处理 bash
-        // 这里用一种折中方案：bash 的 handler 需要知道 toolUseId
-        // 实际上 toolUseId 在 agentLoop 中才能获取，所以 bash 的持久化
-        // 需要在 agentLoop 中处理。这里我们在 handler 中先不做持久化。
-        toolHandlers.put("bash", input -> {
-            String command = (String) input.get("command");
-            if (command == null || command.isBlank()) return "Error: command is required";
-            return runBash(command, "unknown");
-        });
-
-        toolHandlers.put("read_file", input -> {
-            String path = (String) input.get("path");
-            if (path == null || path.isBlank()) return "Error: path is required";
-            Integer limit = null;
-            Object limitObj = input.get("limit");
-            if (limitObj instanceof Number num) limit = num.intValue();
-            return runRead(path, limit, "unknown");
-        });
 
         toolHandlers.put("write_file", input -> {
             String path = (String) input.get("path");
@@ -963,6 +1017,9 @@ public class S06ContextCompact {
 
         // conversationLog 记录对话历史（用于压缩时生成摘要）
         List<String> conversationLog = new ArrayList<>();
+
+        // 压缩状态（对应 Python 原版的 CompactState）
+        CompactState compactState = new CompactState();
 
         // 使用数组包装 paramsBuilder，使其在 auto-compact 时可以被替换
         // （因为 auto-compact 会重建整个 builder）
@@ -1001,7 +1058,7 @@ public class S06ContextCompact {
             // 执行集成压缩的 Agent 循环
             try {
                 agentLoop(client, model, paramsHolder, systemPrompt, tools,
-                        toolHandlers, conversationLog, tokenEstimate);
+                        toolHandlers, conversationLog, tokenEstimate, compactState);
             } catch (Exception e) {
                 System.err.println(red("Error: " + e.getMessage()));
             }
