@@ -95,7 +95,7 @@ public class S18WorktreeIsolation {
                 + "run commands in those lanes, then choose keep/remove for closeout. "
                 + "Use worktree_events when you need lifecycle visibility.";
 
-        // ---- 工具定义（16 个） ----
+        // ---- 工具定义（18 个） ----
         List<Tool> tools = List.of(
                 defineTool("bash", "Run a shell command.", Map.of("command", Map.of("type","string")), List.of("command")),
                 defineTool("read_file", "Read file contents.", Map.of("path",Map.of("type","string"),"limit",Map.of("type","integer")), List.of("path")),
@@ -105,14 +105,16 @@ public class S18WorktreeIsolation {
                 defineTool("task_create", "Create a new task.", Map.of("subject",Map.of("type","string"),"description",Map.of("type","string")), List.of("subject")),
                 defineTool("task_list", "List all tasks.", Map.of(), null),
                 defineTool("task_get", "Get task details.", Map.of("task_id",Map.of("type","integer")), List.of("task_id")),
-                defineTool("task_update", "Update task status or owner.", Map.of("task_id",Map.of("type","integer"),"status",Map.of("type","string","enum",List.of("pending","in_progress","completed")),"owner",Map.of("type","string")), List.of("task_id")),
+                defineTool("task_update", "Update task status or owner.", Map.of("task_id",Map.of("type","integer"),"status",Map.of("type","string","enum",List.of("pending","in_progress","completed","deleted")),"owner",Map.of("type","string")), List.of("task_id")),
                 defineTool("task_bind_worktree", "Bind task to worktree.", Map.of("task_id",Map.of("type","integer"),"worktree",Map.of("type","string"),"owner",Map.of("type","string")), List.of("task_id","worktree")),
                 // Worktree 工具
                 defineTool("worktree_create", "Create git worktree.", Map.of("name",Map.of("type","string"),"task_id",Map.of("type","integer"),"base_ref",Map.of("type","string")), List.of("name")),
                 defineTool("worktree_list", "List worktrees.", Map.of(), null),
+                defineTool("worktree_enter", "Enter or reopen a worktree lane before working in it.", Map.of("name",Map.of("type","string")), List.of("name")),
                 defineTool("worktree_status", "Show git status for worktree.", Map.of("name",Map.of("type","string")), List.of("name")),
                 defineTool("worktree_run", "Run command in worktree.", Map.of("name",Map.of("type","string"),"command",Map.of("type","string")), List.of("name","command")),
-                defineTool("worktree_remove", "Remove worktree.", Map.of("name",Map.of("type","string"),"force",Map.of("type","boolean"),"complete_task",Map.of("type","boolean")), List.of("name")),
+                defineTool("worktree_closeout", "Close out a lane by keeping or removing it.", Map.of("name",Map.of("type","string"),"action",Map.of("type","string","enum",List.of("keep","remove")),"reason",Map.of("type","string"),"force",Map.of("type","boolean"),"complete_task",Map.of("type","boolean")), List.of("name","action")),
+                defineTool("worktree_remove", "Remove worktree.", Map.of("name",Map.of("type","string"),"force",Map.of("type","boolean"),"complete_task",Map.of("type","boolean"),"reason",Map.of("type","string")), List.of("name")),
                 defineTool("worktree_keep", "Mark worktree as kept.", Map.of("name",Map.of("type","string")), List.of("name")),
                 defineTool("worktree_events", "List recent events.", Map.of("limit",Map.of("type","integer")), null)
         );
@@ -130,9 +132,11 @@ public class S18WorktreeIsolation {
         handlers.put("task_bind_worktree", input -> bindWorktree(((Number)input.get("task_id")).intValue(), (String)input.get("worktree"), (String)input.getOrDefault("owner","")));
         handlers.put("worktree_create", input -> createWorktree((String)input.get("name"), input.get("task_id") instanceof Number n ? n.intValue() : null, (String)input.get("base_ref")));
         handlers.put("worktree_list", input -> listWorktrees());
+        handlers.put("worktree_enter", input -> enterWorktree((String)input.get("name")));
         handlers.put("worktree_status", input -> worktreeStatus((String)input.get("name")));
         handlers.put("worktree_run", input -> worktreeRun((String)input.get("name"), (String)input.get("command")));
-        handlers.put("worktree_remove", input -> removeWorktree((String)input.get("name"), Boolean.TRUE.equals(input.get("force")), Boolean.TRUE.equals(input.get("complete_task"))));
+        handlers.put("worktree_closeout", input -> closeoutWorktree((String)input.get("name"), (String)input.get("action"), (String)input.getOrDefault("reason",""), Boolean.TRUE.equals(input.get("force")), Boolean.TRUE.equals(input.get("complete_task"))));
+        handlers.put("worktree_remove", input -> removeWorktree((String)input.get("name"), Boolean.TRUE.equals(input.get("force")), Boolean.TRUE.equals(input.get("complete_task")), (String)input.getOrDefault("reason","")));
         handlers.put("worktree_keep", input -> keepWorktree((String)input.get("name")));
         handlers.put("worktree_events", input -> recentEvents(input.get("limit") instanceof Number n ? n.intValue() : 20));
 
@@ -223,11 +227,11 @@ public class S18WorktreeIsolation {
 
     // ==================== EventBus ====================
 
-    private static void emitEvent(String event, Map<String,Object> task, Map<String,Object> worktree, String error) {
+    private static void emitEvent(String event, Integer taskId, String wtName, String error) {
         var payload = new LinkedHashMap<String,Object>();
         payload.put("event", event); payload.put("ts", System.currentTimeMillis()/1000.0);
-        payload.put("task", task != null ? task : Map.of());
-        payload.put("worktree", worktree != null ? worktree : Map.of());
+        if (taskId != null) payload.put("task_id", taskId);
+        if (wtName != null) payload.put("worktree", wtName);
         if (error != null) payload.put("error", error);
         try { Files.writeString(eventsPath, MAPPER.writeValueAsString(payload)+"\n", StandardOpenOption.CREATE, StandardOpenOption.APPEND); } catch (IOException ignored) {}
     }
@@ -268,6 +272,8 @@ public class S18WorktreeIsolation {
         var task = new LinkedHashMap<String,Object>();
         task.put("id", nextTaskId); task.put("subject", subject); task.put("description", description!=null?description:"");
         task.put("status","pending"); task.put("owner",""); task.put("worktree","");
+        task.put("worktree_state","unbound"); task.put("last_worktree","");
+        task.put("closeout",null); task.put("blockedBy",List.of());
         task.put("created_at",System.currentTimeMillis()/1000.0); task.put("updated_at",System.currentTimeMillis()/1000.0);
         saveTask(task); nextTaskId++;
         try { return MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(task); } catch (IOException e) { return task.toString(); }
@@ -277,7 +283,7 @@ public class S18WorktreeIsolation {
 
     private static synchronized String updateTask(int id, String status, String owner) {
         var task = loadTask(id);
-        if (status != null) { if (!List.of("pending","in_progress","completed").contains(status)) return "Error: Invalid status: "+status; task.put("status", status); }
+        if (status != null) { if (!List.of("pending","in_progress","completed","deleted").contains(status)) return "Error: Invalid status: "+status; task.put("status", status); }
         if (owner != null) task.put("owner", owner);
         saveTask(task);
         try { return MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(task); } catch (IOException e) { return task.toString(); }
@@ -285,6 +291,7 @@ public class S18WorktreeIsolation {
 
     private static synchronized String bindWorktree(int id, String worktree, String owner) {
         var task = loadTask(id); task.put("worktree", worktree);
+        task.put("last_worktree", worktree); task.put("worktree_state", "active");
         if (owner != null && !owner.isEmpty()) task.put("owner", owner);
         if ("pending".equals(task.get("status"))) task.put("status","in_progress");
         saveTask(task);
@@ -292,7 +299,19 @@ public class S18WorktreeIsolation {
     }
 
     private static synchronized String unbindWorktree(int id) {
-        var task = loadTask(id); task.put("worktree",""); saveTask(task);
+        var task = loadTask(id); task.put("worktree",""); task.put("worktree_state","unbound"); saveTask(task);
+        try { return MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(task); } catch (IOException e) { return task.toString(); }
+    }
+
+    private static synchronized String recordCloseout(int id, String action, String reason, boolean keepBinding) {
+        var task = loadTask(id);
+        var closeout = new LinkedHashMap<String,Object>();
+        closeout.put("action", action); closeout.put("reason", reason != null ? reason : "");
+        closeout.put("at", System.currentTimeMillis()/1000.0);
+        task.put("closeout", closeout);
+        task.put("worktree_state", action);
+        if (!keepBinding) task.put("worktree", "");
+        saveTask(task);
         try { return MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(task); } catch (IOException e) { return task.toString(); }
     }
 
@@ -333,17 +352,17 @@ public class S18WorktreeIsolation {
             if (findWorktree(name) != null) return "Error: Worktree '"+name+"' already exists";
             if (taskId != null && !Files.exists(tasksDir.resolve("task_"+taskId+".json"))) return "Error: Task "+taskId+" not found";
             Path path = worktreeDir.resolve(name); String branch = "wt/"+name; String ref = baseRef != null ? baseRef : "HEAD";
-            emitEvent("worktree.create.before", taskId!=null?Map.of("id",taskId):null, Map.of("name",name,"base_ref",ref), null);
+            emitEvent("worktree.create.before", taskId, name, null);
             runGit("worktree","add","-b",branch,path.toString(),ref);
             var entry = new LinkedHashMap<String,Object>();
             entry.put("name",name); entry.put("path",path.toString()); entry.put("branch",branch);
             entry.put("task_id",taskId); entry.put("status","active"); entry.put("created_at",System.currentTimeMillis()/1000.0);
             var index = loadIndex(); ((List<Map<String,Object>>)index.get("worktrees")).add(entry); saveIndex(index);
             if (taskId != null) bindWorktree(taskId, name, "");
-            emitEvent("worktree.create.after", taskId!=null?Map.of("id",taskId):null, Map.of("name",name,"path",path.toString(),"branch",branch,"status","active"), null);
+            emitEvent("worktree.create.after", taskId, name, null);
             return MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(entry);
         } catch (IllegalArgumentException e) { return "Error: "+e.getMessage(); }
-        catch (Exception e) { emitEvent("worktree.create.failed",null,Map.of("name",name),e.getMessage()); return "Error: "+e.getMessage(); }
+        catch (Exception e) { emitEvent("worktree.create.failed",null,name,e.getMessage()); return "Error: "+e.getMessage(); }
     }
 
     @SuppressWarnings("unchecked")
@@ -367,45 +386,104 @@ public class S18WorktreeIsolation {
         } catch (Exception e) { return "Error: "+e.getMessage(); }
     }
 
+    private static String enterWorktree(String name) {
+        try { var wt=findWorktree(name); if (wt==null) return "Error: Unknown worktree '"+name+"'";
+            Path path=Path.of((String)wt.get("path")); if (!Files.exists(path)) return "Error: Path missing: "+path;
+            var index=loadIndex();
+            for (var item:(List<Map<String,Object>>)index.get("worktrees")) if (name.equals(item.get("name"))) { item.put("last_entered_at",System.currentTimeMillis()/1000.0); }
+            saveIndex(index);
+            Integer tid = wt.get("task_id")!=null ? ((Number)wt.get("task_id")).intValue() : null;
+            emitEvent("worktree.enter", tid, name, null);
+            var updated = findWorktree(name);
+            return updated!=null ? MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(updated) : "Error: not found after update";
+        } catch (Exception e) { return "Error: "+e.getMessage(); }
+    }
+
     private static String worktreeRun(String name, String command) {
         if (command == null || command.isBlank()) return "Error: command required";
         for (String d : List.of("rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"))
             if (command.contains(d)) return "Error: Dangerous command blocked";
         try { var wt=findWorktree(name); if (wt==null) return "Error: Unknown worktree '"+name+"'";
             Path path=Path.of((String)wt.get("path")); if (!Files.exists(path)) return "Error: Path missing: "+path;
+            Integer tid = wt.get("task_id")!=null ? ((Number)wt.get("task_id")).intValue() : null;
+            var index=loadIndex();
+            for (var item:(List<Map<String,Object>>)index.get("worktrees")) if (name.equals(item.get("name"))) {
+                item.put("last_entered_at",System.currentTimeMillis()/1000.0);
+                item.put("last_command_at",System.currentTimeMillis()/1000.0);
+                item.put("last_command_preview",command.substring(0,Math.min(120,command.length())));
+            }
+            saveIndex(index);
+            emitEvent("worktree.run.before", tid, name, null);
             ProcessBuilder pb = System.getProperty("os.name").toLowerCase().contains("win")
                 ? new ProcessBuilder("cmd", "/c", command)
                 : new ProcessBuilder("bash", "-c", command);
             pb.directory(path.toFile()); pb.redirectErrorStream(true);
             Process p=pb.start(); String o=new String(p.getInputStream().readAllBytes()).trim();
-            if (!p.waitFor(300,TimeUnit.SECONDS)) { p.destroyForcibly(); return "Error: Timeout"; }
+            if (!p.waitFor(300,TimeUnit.SECONDS)) { p.destroyForcibly(); emitEvent("worktree.run.timeout",tid,name,null); return "Error: Timeout (300s)"; }
+            emitEvent("worktree.run.after", tid, name, null);
             return o.isEmpty()?"(no output)":(o.length()>50000?o.substring(0,50000):o);
         } catch (Exception e) { return "Error: "+e.getMessage(); }
     }
 
     @SuppressWarnings("unchecked")
-    private static String removeWorktree(String name, boolean force, boolean completeTask) {
+    private static String removeWorktree(String name, boolean force, boolean completeTask, String reason) {
         try { var wt=findWorktree(name); if (wt==null) return "Error: Unknown worktree '"+name+"'";
-            emitEvent("worktree.remove.before", wt.get("task_id")!=null?Map.of("id",wt.get("task_id")):null, Map.of("name",name,"path",wt.getOrDefault("path","")), null);
+            Integer tid = wt.get("task_id")!=null ? ((Number)wt.get("task_id")).intValue() : null;
+            emitEvent("worktree.remove.before", tid, name, null);
             var args=new ArrayList<>(List.of("worktree","remove")); if (force) args.add("--force"); args.add((String)wt.get("path"));
             runGit(args.toArray(new String[0]));
-            if (completeTask && wt.get("task_id")!=null) { int tid=((Number)wt.get("task_id")).intValue();
-                try { updateTask(tid,"completed",null); unbindWorktree(tid); emitEvent("task.completed",Map.of("id",tid,"status","completed"),Map.of("name",name),null); } catch (Exception ignored) {} }
-            var index=loadIndex(); for (var item:(List<Map<String,Object>>)index.get("worktrees")) if (name.equals(item.get("name"))) { item.put("status","removed"); item.put("removed_at",System.currentTimeMillis()/1000.0); }
+            if (completeTask && tid!=null) {
+                try { updateTask(tid,"completed",null); emitEvent("task.completed",tid,name,null); } catch (Exception ignored) {}
+            }
+            if (tid!=null) recordCloseout(tid,"removed",reason!=null?reason:"",false);
+            var index=loadIndex();
+            for (var item:(List<Map<String,Object>>)index.get("worktrees")) if (name.equals(item.get("name"))) {
+                item.put("status","removed"); item.put("removed_at",System.currentTimeMillis()/1000.0);
+                var co=new LinkedHashMap<String,Object>(); co.put("action","remove"); co.put("reason",reason!=null?reason:""); co.put("at",System.currentTimeMillis()/1000.0);
+                item.put("closeout",co);
+            }
             saveIndex(index);
-            emitEvent("worktree.remove.after",wt.get("task_id")!=null?Map.of("id",wt.get("task_id")):null,Map.of("name",name,"status","removed"),null);
+            emitEvent("worktree.remove.after",tid,name,null);
             return "Removed worktree '"+name+"'";
-        } catch (Exception e) { emitEvent("worktree.remove.failed",null,Map.of("name",name),e.getMessage()); return "Error: "+e.getMessage(); }
+        } catch (Exception e) { emitEvent("worktree.remove.failed",null,name,e.getMessage()); return "Error: "+e.getMessage(); }
     }
 
     @SuppressWarnings("unchecked")
     private static String keepWorktree(String name) {
         try { var wt=findWorktree(name); if (wt==null) return "Error: Unknown worktree '"+name+"'";
+            Integer tid = wt.get("task_id")!=null ? ((Number)wt.get("task_id")).intValue() : null;
+            if (tid!=null) recordCloseout(tid,"kept","",true);
             var index=loadIndex(); Map<String,Object> kept=null;
-            for (var item:(List<Map<String,Object>>)index.get("worktrees")) if (name.equals(item.get("name"))) { item.put("status","kept"); item.put("kept_at",System.currentTimeMillis()/1000.0); kept=item; }
-            saveIndex(index); emitEvent("worktree.keep",wt.get("task_id")!=null?Map.of("id",wt.get("task_id")):null,Map.of("name",name,"path",wt.get("path"),"status","kept"),null);
+            for (var item:(List<Map<String,Object>>)index.get("worktrees")) if (name.equals(item.get("name"))) {
+                item.put("status","kept"); item.put("kept_at",System.currentTimeMillis()/1000.0);
+                var co=new LinkedHashMap<String,Object>(); co.put("action","keep"); co.put("reason",""); co.put("at",System.currentTimeMillis()/1000.0);
+                item.put("closeout",co);
+                kept=item;
+            }
+            saveIndex(index); emitEvent("worktree.keep",tid,name,null);
             return kept!=null ? MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(kept) : "Error: Unknown worktree '"+name+"'";
         } catch (Exception e) { return "Error: "+e.getMessage(); }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static String closeoutWorktree(String name, String action, String reason, boolean force, boolean completeTask) {
+        if ("keep".equals(action)) {
+            try { var wt=findWorktree(name); if (wt==null) return "Error: Unknown worktree '"+name+"'";
+                Integer tid = wt.get("task_id")!=null ? ((Number)wt.get("task_id")).intValue() : null;
+                if (tid!=null) { recordCloseout(tid,"kept",reason!=null?reason:"",true); if (completeTask) updateTask(tid,"completed",null); }
+                var index=loadIndex();
+                for (var item:(List<Map<String,Object>>)index.get("worktrees")) if (name.equals(item.get("name"))) {
+                    item.put("status","kept"); item.put("kept_at",System.currentTimeMillis()/1000.0);
+                    var co=new LinkedHashMap<String,Object>(); co.put("action","keep"); co.put("reason",reason!=null?reason:""); co.put("at",System.currentTimeMillis()/1000.0);
+                    item.put("closeout",co);
+                }
+                saveIndex(index); emitEvent("worktree.closeout.keep",tid,name,null);
+                var updated=findWorktree(name);
+                return updated!=null ? MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(updated) : "Kept '"+name+"'";
+            } catch (Exception e) { return "Error: "+e.getMessage(); }
+        }
+        if ("remove".equals(action)) { return removeWorktree(name, force, completeTask, reason); }
+        return "Error: action must be 'keep' or 'remove'";
     }
 
     // ==================== 基础设施 ====================

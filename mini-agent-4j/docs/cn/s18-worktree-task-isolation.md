@@ -568,18 +568,173 @@ Java 实现里每次 worktree 操作都会通过 `emitEvent` 写入 `.worktrees/
 
 ## 试一试
 
+### 启动
+
 ```sh
 cd mini-agent-4j
 mvn compile exec:java -Dexec.mainClass="com.example.agent.sessions.S18WorktreeIsolation"
 ```
 
-可以试试这些任务：
+启动时确认 `.tasks/` 和 `.worktrees/` 目录被自动创建，`.worktrees/index.json` 和 `.worktrees/events.jsonl` 初始化完成。
 
-1. 为两个不同任务各建一个 worktree，观察 `/tasks` 和 `/worktrees` 的对应关系。
-2. 分别在两个 worktree 里运行 `git status`（用 `worktree_status`），感受目录隔离。
-3. 删除一个 worktree（`worktree_remove` 带 `complete_task=true`），确认对应任务被正确收尾。
-4. 保留一个 worktree（`worktree_keep`），确认它的状态变为 `kept` 而任务不变。
-5. `/events` 查看完整生命周期事件日志。
+### 案例 1：Task + Worktree 绑定 → 执行 → Remove 收尾完整生命周期
+
+> 从创建任务到分配车道、执行命令、最终删除车道并完结任务，走完一条完整隔离执行链路。
+
+先创建任务并分配 worktree：
+
+```
+创建一个任务：统计 src 目录下的 Java 文件数量
+```
+
+```
+为这个任务创建一个 worktree（名字叫 count-files）
+```
+
+在车道里执行命令：
+
+```
+在 count-files 这个 worktree 里运行命令：find src -name "*.java" | wc -l
+```
+
+最后删除车道并完结任务：
+
+```
+删除 count-files 这个 worktree，同时把对应任务标记为 completed
+```
+
+观察要点：
+- `task_create` 创建 `.tasks/task_1.json`，`status` 为 `"pending"`，`worktree` 为空
+- `worktree_create` 同时传入 `task_id`，自动触发 `bindWorktree`
+- `.tasks/task_1.json` 更新：`worktree` 变为 `"count-files"`，`worktree_state` 变为 `"active"`，`status` 变为 `"in_progress"`，`last_worktree` 变为 `"count-files"`
+- `.worktrees/index.json` 新增条目：`name`、`path`、`branch`（`wt/count-files`）、`task_id`、`status: "active"`
+- `worktree_run` 在 `.worktrees/count-files/` 目录下执行命令，命令输出是 Java 文件数量
+- `/tasks` 显示 `#1: 统计 src... wt=count-files`，`/worktrees` 或 `/wt` 显示 `[active] count-files`
+- `worktree_remove` 传入 `complete_task=true`：git worktree 被删除，任务 `status` 变为 `"completed"`
+- `.tasks/task_1.json` 新增 `closeout` 字段：`{"action":"remove","reason":"","at":...}`，`worktree_state` 变为 `"removed"`，`worktree` 变为空
+- `.worktrees/index.json` 中条目 `status` 变为 `"removed"`，新增 `removed_at` 和 `closeout` 字段
+
+### 案例 2：worktree_enter + 元数据追踪 + Keep 收尾
+
+> 使用 worktree_enter 显式进入车道，观察 index.json 中的元数据追踪，最后用 keep 保留车道。
+
+先创建任务和 worktree：
+
+```
+创建一个任务：检查 README.md 的行数
+```
+
+```
+为这个任务创建一个 worktree（名字叫 check-readme）
+```
+
+显式进入车道并执行命令：
+
+```
+进入 check-readme 这个 worktree
+```
+
+```
+在 check-readme 里运行命令：wc -l README.md
+```
+
+保留车道：
+
+```
+保留 check-readme 这个 worktree
+```
+
+观察要点：
+- `worktree_enter` 调用后，`.worktrees/index.json` 中对应条目新增 `last_entered_at` 时间戳
+- `worktree_run` 执行后，条目新增 `last_command_at` 和 `last_command_preview`（命令前 120 字符）
+- `worktree_keep` 调用后，条目 `status` 变为 `"kept"`，新增 `kept_at` 和 `closeout` 字段
+- `.tasks/` 对应任务新增 `closeout` 字段：`{"action":"keep","reason":"","at":...}`，`worktree_state` 变为 `"kept"`
+- 与案例 1 不同：任务 `worktree` 字段保留为 `"check-readme"`（keep 绑定不移除），`status` 仍为 `"in_progress"`（未被完结）
+- `/wt` 显示 `[kept] check-readme`
+
+### 案例 3：worktree_closeout 统一收尾 + reason 审计
+
+> 使用 worktree_closeout 工具统一处理收尾，传入 reason 参数，验证 closeout 记录的完整性。
+
+先创建两个任务和两个 worktree：
+
+```
+创建一个任务：检查 pom.xml 里的依赖数量
+```
+
+```
+为这个任务创建一个 worktree（名字叫 deps-check）
+```
+
+```
+创建一个任务：列出 docs 目录下的文件
+```
+
+```
+为这个任务创建一个 worktree（名字叫 docs-list）
+```
+
+分别用 closeout 工具收尾（一个 keep，一个 remove）：
+
+```
+对 deps-check 执行 closeout，action=keep，reason="dependencies verified"
+```
+
+```
+对 docs-list 执行 closeout，action=remove，reason="listing completed"，同时完结任务
+```
+
+观察要点：
+- `worktree_closeout` 的 `action=keep` 走 keep 分支：`.worktrees/index.json` 条目 `status` 变为 `"kept"`，`closeout.reason` 为 `"dependencies verified"`
+- `worktree_closeout` 的 `action=remove` 走 remove 分支：等价于 `worktree_remove`，但额外传入 `reason`
+- 两个任务的 `.tasks/task_*.json` 各自有 `closeout` 记录，`action` 和 `reason` 分别对应 `"keep"/"removed"`
+- `deps-check` 的任务 `worktree` 字段保留（keep_binding=true），`docs-list` 的任务 `worktree` 字段被清空
+- `/events` 包含 `worktree.closeout.keep` 事件（deps-check），以及 `worktree.remove.before/after` 事件（docs-list）
+
+### 案例 4：并行多 Worktree + events.jsonl 审计日志
+
+> 同时操作多条车道，通过 events.jsonl 回溯完整生命周期，验证事件记录的准确性和隔离性。
+
+创建两条独立车道并分别在各自目录里操作：
+
+```
+创建一个任务：在 worktree 里创建一个临时文件
+```
+
+```
+为这个任务创建一个 worktree（名字叫 lane-a）
+```
+
+```
+创建一个任务：在另一个 worktree 里查看 git 分支
+```
+
+```
+为这个任务创建一个 worktree（名字叫 lane-b）
+```
+
+```
+在 lane-a 里运行命令：echo "hello from lane-a" > test-output.txt
+```
+
+```
+在 lane-b 里运行命令：git branch
+```
+
+查看事件日志：
+
+```
+查看最近的事件日志
+```
+
+观察要点：
+- 两条车道各自独立：`lane-a` 的文件写入不影响 `lane-b` 的目录
+- `worktree_run` 对 `lane-a` 触发 `worktree.run.before` 和 `worktree.run.after` 事件，`task_id` 指向任务 1
+- `worktree_run` 对 `lane-b` 触发相同事件，`task_id` 指向任务 2
+- `/events` 或 `worktree_events` 返回的事件按时间顺序排列，包含完整字段：`event`、`ts`、`task_id`、`worktree`
+- 事件类型覆盖完整生命周期：`worktree.create.before/after`（创建）、`worktree.run.before/after`（执行）、`worktree.remove.before/after` 或 `worktree.keep`（收尾）
+- 每条事件的 `worktree` 字段准确标识了发生在哪条车道
+- 即使两条车道同时操作，事件日志通过 `task_id` 和 `worktree` 字段可以清楚区分各车道活动
 
 读完这一章，你应该能自己说清楚这句话：
 
