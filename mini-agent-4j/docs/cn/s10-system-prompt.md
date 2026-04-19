@@ -292,6 +292,146 @@ Path subdirClaude = cwd.resolve("CLAUDE.md");
 所以 `s10` 的价值不是"新加一个功能"，
 而是"把前面长出来的功能组织成一份清楚的系统输入"。
 
+## 试一试
+
+### 启动
+
+```sh
+cd mini-agent-4j
+mvn compile exec:java -Dexec.mainClass="com.example.agent.sessions.S10SystemPrompt"
+```
+
+启动时观察 dim 输出：`S10 System Prompt — assembled: N chars, ~N sections`（确认段落组装成功）。
+
+### 案例 1：基础段落组装（/sections + /prompt 验证）
+
+> 用 /sections 查看段落结构，用 /prompt 查看完整组装内容。
+
+启动后输入：
+
+```
+/sections
+```
+
+观察要点：
+- 输出包含 `# Available tools`、`=== DYNAMIC_BOUNDARY ===`、`# Dynamic context` 等段落标题
+- `# Available tools` 段落列出 4 个工具：bash、read_file、write_file、edit_file
+- DYNAMIC_BOUNDARY 之前的段落是稳定的，之后是动态的
+
+再查看完整提示词：
+
+```
+/prompt
+```
+
+观察要点：
+- 输出 `--- System Prompt ---` 和 `--- End ---` 之间是完整组装内容
+- 段落 1（core）以 "You are a coding agent operating in..." 开头
+- 段落 6（dynamic）包含当前日期、工作目录、模型 ID、操作系统平台
+
+### 案例 2：Skills 段落注入
+
+> 创建 skills 目录和 SKILL.md 文件，重启验证技能元数据被组装进提示词。
+
+先创建测试技能：
+
+```sh
+mkdir -p skills/docker
+```
+
+创建 `skills/docker/SKILL.md`：
+
+```text
+---
+name: docker
+description: Docker 容器化部署指南
+---
+## Docker 部署步骤
+1. 在项目根目录创建 Dockerfile
+2. 使用多阶段构建减小镜像体积
+```
+
+重启 Agent 后输入：
+
+```
+/sections
+```
+
+观察要点：
+- 段落列表新增 `# Available skills` —— 段落 3 被自动注入
+- 输入 `/prompt` 可看到 `- docker: Docker 容器化部署指南`
+- 技能正文不在提示词中（只有 Layer 1 元数据：name + description）
+
+### 案例 3：Memory 段落注入
+
+> 创建 .memory 目录和记忆文件，重启验证记忆内容被组装进提示词。
+
+创建 `.memory/deploy_env.md`：
+
+```text
+---
+name: deploy_env
+description: 生产环境部署地址
+type: reference
+---
+生产环境 API 部署在 api.example.com，前端部署在 web.example.com。
+```
+
+重启 Agent 后输入：
+
+```
+/sections
+```
+
+观察要点：
+- 段落列表新增 `# Memories (persistent)` —— 段落 4 被自动注入
+- 输入 `/prompt` 可看到 `[reference] deploy_env: 生产环境部署地址`
+- 记忆正文也在提示词中（与 skills 不同，memory 的完整内容会被注入）
+
+然后在 REPL 中提问验证记忆生效：
+
+```
+生产环境的 API 地址是什么？
+```
+
+观察要点：
+- 模型从系统提示词的记忆段落中找到答案，直接回答 `api.example.com`
+- 无需调用工具读取文件（记忆已在 system prompt 中）
+
+### 案例 4：CLAUDE.md 链加载 + DYNAMIC_BOUNDARY 验证
+
+> 创建项目级 CLAUDE.md，重启验证指令链被组装；同时确认静态/动态分界。
+
+在项目根目录创建 `CLAUDE.md`：
+
+```text
+# 项目规则
+- 所有 Java 文件使用 4 空格缩进
+- 提交信息使用中文
+- 不要修改 vendors/ 目录下的文件
+```
+
+重启 Agent 后输入：
+
+```
+/sections
+```
+
+观察要点：
+- 段落列表新增 `# CLAUDE.md instructions` 和 `## From project root (CLAUDE.md)` —— 段落 5 被注入
+- DYNAMIC_BOUNDARY 位于 CLAUDE.md 和 Dynamic context 之间，标记静态/动态分界
+- 如果在 `~/.claude/CLAUDE.md` 也放了文件，会看到 `## From user global` 出现在 `## From project root` 之前
+
+验证规则生效：
+
+```
+帮我修改 vendors 目录下的某个文件
+```
+
+观察要点：
+- 模型遵守 CLAUDE.md 中的规则，拒绝修改 vendors/ 目录
+- 这证明 CLAUDE.md 指令通过系统提示词组装影响了模型行为
+
 ## 学完这章后你应该能回答
 
 - 为什么 system prompt 不能只是一整块硬编码文本？

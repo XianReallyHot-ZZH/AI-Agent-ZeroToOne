@@ -150,6 +150,8 @@ public class S10SystemPrompt {
         }
 
         if (baseUrl != null && !baseUrl.isBlank()) {
+            // 与 Python 原版对齐：自定义 baseUrl 时清除 ANTHROPIC_AUTH_TOKEN 避免冲突
+            System.clearProperty("ANTHROPIC_AUTH_TOKEN");
             return AnthropicOkHttpClient.builder()
                     .apiKey(apiKey)
                     .baseUrl(baseUrl)
@@ -913,6 +915,26 @@ public class S10SystemPrompt {
 
             return String.join("\n\n", sections);
         }
+    }
+
+    // ==================== System Reminder 构建 ====================
+
+    /**
+     * 构建系统提醒用户消息（用于每轮动态内容注入）。
+     * <p>
+     * 教学版将提醒放在稳定系统提示词之外，避免短生命周期内容
+     * 混入长期指令中。
+     * <p>
+     * 对应 Python 原版：build_system_reminder(extra) 函数。
+     *
+     * @param extra 要注入的额外内容，null 时返回 null
+     * @return 包含 &lt;system-reminder&gt; 的用户消息内容字符串，无内容时返回 null
+     */
+    private static String buildSystemReminder(String extra) {
+        if (extra == null || extra.isEmpty()) {
+            return null;
+        }
+        return "<system-reminder>\n" + extra + "\n</system-reminder>";
     }
 
     // ==================== Agent 核心循环 ====================
