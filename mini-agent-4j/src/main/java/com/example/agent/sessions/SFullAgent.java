@@ -62,6 +62,18 @@ public class SFullAgent {
     private static final int POLL_INTERVAL_SECONDS = 5;
     /** Teammate IDLE 阶段超时（秒），超时后自动 shutdown */
     private static final int IDLE_TIMEOUT_SECONDS = 60;
+    /** Microcompact: 保留最近 N 个 tool_result turn */
+    private static final int KEEP_RECENT = 3;
+    /** Microcompact: 这些工具的结果不压缩 */
+    private static final Set<String> PRESERVE_RESULT_TOOLS = Set.of("read_file");
+
+    /** 合法的消息类型（s16 协议验证） */
+    private static final Set<String> VALID_MSG_TYPES = Set.of("message", "broadcast", "shutdown_request", "shutdown_response", "plan_approval_response");
+
+    /** 持久化输出阈值（字符数） */
+    private static final int PERSIST_TRIGGER_DEFAULT = 50000;
+    private static final int PERSIST_TRIGGER_BASH = 30000;
+    private static final int PERSISTED_PREVIEW_CHARS = 2000;
 
     // ---- 路径 ----
     private static final Path TASKS_DIR = WORKDIR.resolve(".tasks");
@@ -70,6 +82,8 @@ public class SFullAgent {
     private static final Path SKILLS_DIR = WORKDIR.resolve("skills");
     private static final Path TRANSCRIPT_DIR = WORKDIR.resolve(".transcripts");
     private static final Path CONFIG_PATH = TEAM_DIR.resolve("config.json");
+    private static final Path TASK_OUTPUT_DIR = WORKDIR.resolve(".task_outputs");
+    private static final Path TOOL_RESULTS_DIR = TASK_OUTPUT_DIR.resolve("tool-results");
 
     // ---- 全局模块 ----
     private static AnthropicClient client;
@@ -92,6 +106,7 @@ public class SFullAgent {
     // ---- 压缩追踪 ----
     private static long tokenEstimate = 0;
     private static final List<String> conversationLog = new ArrayList<>();
+    private static List<Object> messageHistory = new ArrayList<>();
 
     // ---- 主循环状态 ----
     private static MessageCreateParams.Builder paramsBuilder;
@@ -154,7 +169,7 @@ public class SFullAgent {
 
             switch (query) {
                 case "/compact" -> {
-                    if (!conversationLog.isEmpty()) { System.out.println("[manual compact]"); doAutoCompact(); }
+                    if (!conversationLog.isEmpty()) { System.out.println("[manual compact]"); doAutoCompact(messageHistory, null); }
                     continue;
                 }
                 case "/tasks" -> { System.out.println(listTasks()); continue; }
@@ -168,6 +183,7 @@ public class SFullAgent {
             }
 
             paramsBuilder.addUserMessage(query);
+            messageHistory.add(query);
             tokenEstimate += query.length() / 4;
             conversationLog.add("user: " + query);
 
@@ -193,10 +209,13 @@ public class SFullAgent {
         int roundsWithoutTodo = 0;
 
         while (true) {
-            // ---- 1. Auto-compact ----
-            if (tokenEstimate > TOKEN_THRESHOLD) doAutoCompact();
+            // ---- 1. Microcompact ----
+            microcompact(messageHistory);
 
-            // ---- 2. Drain 后台通知 ----
+            // ---- 2. Auto-compact ----
+            if (tokenEstimate > TOKEN_THRESHOLD) doAutoCompact(messageHistory, null);
+
+            // ---- 3. Drain 后台通知 ----
             var notifs = bg.drain();
             if (!notifs.isEmpty()) {
                 var sb = new StringBuilder("<background-results>\n");
@@ -204,42 +223,50 @@ public class SFullAgent {
                 sb.append("</background-results>");
                 String txt = sb.toString();
                 System.out.println(ANSI_YELLOW + txt.replace("<background-results>\n","").replace("</background-results>","").trim() + ANSI_RESET);
-                paramsBuilder.addUserMessage(txt);
-                paramsBuilder.addAssistantMessage("Noted background results.");
+                messageHistory.add(txt); messageHistory.add("__ack_bg__");
             }
 
-            // ---- 3. Drain lead inbox ----
+            // ---- 4. Drain lead inbox ----
             var inbox = bus.readInbox("lead");
             if (!inbox.isEmpty()) {
-                try { paramsBuilder.addUserMessage("<inbox>" + MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(inbox) + "</inbox>");
-                    paramsBuilder.addAssistantMessage("Noted inbox messages.");
+                try { messageHistory.add("<inbox>" + MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(inbox) + "</inbox>");
+                    messageHistory.add("__ack_inbox__");
                 } catch (Exception ignored) {}
             }
 
-            // ---- 4. LLM 调用 ----
-            Message response = client.messages().create(paramsBuilder.build());
-            paramsBuilder.addMessage(response);
+            // ---- 5. Rebuild paramsBuilder from history ----
+            rebuildFromHistory(messageHistory);
 
-            for (ContentBlock block : response.content()) block.text().ifPresent(tb -> { tokenEstimate += tb.text().length()/4; conversationLog.add("assistant: "+tb.text()); });
+            // ---- 6. LLM 调用 ----
+            Message response = client.messages().create(paramsBuilder.build());
+            messageHistory.add(response);
+
+            for (ContentBlock block : response.content()) {
+                block.text().ifPresent(tb -> { tokenEstimate += tb.text().length()/4; conversationLog.add("assistant: "+tb.text()); });
+            }
 
             if (!response.stopReason().map(StopReason.TOOL_USE::equals).orElse(false)) {
                 for (ContentBlock block : response.content()) block.text().ifPresent(tb -> System.out.println(tb.text()));
                 return;
             }
 
-            // ---- 5. 工具执行 ----
+            // ---- 7. 工具执行 ----
             List<ContentBlockParam> results = new ArrayList<>();
+            List<String> resultToolNames = new ArrayList<>();
+            List<String> resultToolUseIds = new ArrayList<>();
             boolean usedTodo = false;
             boolean manualCompress = false;
+            String compactFocus = null;
 
             for (ContentBlock block : response.content()) {
                 if (!block.isToolUse()) continue;
                 ToolUseBlock tu = block.asToolUse();
-                if ("compress".equals(tu.name())) manualCompress = true;
-                if ("TodoWrite".equals(tu.name())) usedTodo = true;
-
                 @SuppressWarnings("unchecked") Map<String,Object> input = (Map<String,Object>) jsonValueToObject(tu._input());
                 if (input == null) input = Map.of();
+                if (!(input instanceof LinkedHashMap)) { var m = new LinkedHashMap<>(input); input = m; }
+                input.put("_tool_use_id", tu.id());
+                if ("compress".equals(tu.name())) { manualCompress = true; compactFocus = input.get("focus") instanceof String s ? s : null; }
+                if ("TodoWrite".equals(tu.name())) usedTodo = true;
 
                 var handler = dispatch.get(tu.name());
                 String output;
@@ -250,22 +277,97 @@ public class SFullAgent {
                 if (output.length() > MAX_OUTPUT) output = output.substring(0, MAX_OUTPUT);
 
                 results.add(ContentBlockParam.ofToolResult(ToolResultBlockParam.builder().toolUseId(tu.id()).content(output).build()));
+                resultToolNames.add(tu.name());
+                resultToolUseIds.add(tu.id());
                 tokenEstimate += output.length()/4;
                 conversationLog.add("tool("+tu.name()+"): "+output.substring(0, Math.min(200,output.length())));
             }
 
-            // ---- 6. Nag reminder（s03 机制） ----
-            // 如果有未完成的 todo 项但连续 3 轮没有使用 TodoWrite，
-            // 在工具结果前插入提醒消息，促使 LLM 更新待办列表状态
+            // ---- 8. Nag reminder（s03 机制） ----
             roundsWithoutTodo = usedTodo ? 0 : roundsWithoutTodo + 1;
             if (todo.hasOpenItems() && roundsWithoutTodo >= 3) {
                 results.add(0, ContentBlockParam.ofText(TextBlockParam.builder().text("<reminder>Update your todos.</reminder>").build()));
             }
 
-            paramsBuilder.addUserMessageOfBlockParams(results);
+            var turnInfo = new LinkedHashMap<Object,Object>();
+            turnInfo.put("blocks", results);
+            turnInfo.put("tools", resultToolNames);
+            turnInfo.put("ids", resultToolUseIds);
+            messageHistory.add(turnInfo);
 
-            // ---- 7. Manual compress ----
-            if (manualCompress) { System.out.println("[manual compact]"); doAutoCompact(); }
+            // ---- 9. Manual compress ----
+            if (manualCompress) { System.out.println("[manual compact]"); doAutoCompact(messageHistory, compactFocus); }
+        }
+    }
+
+    /** Microcompact：保留最近 KEEP_RECENT 个 tool_result turns，旧的替换为短摘要 */
+    @SuppressWarnings("unchecked")
+    private static void microcompact(List<Object> history) {
+        // history 中元素类型：
+        //   String (user text / ack marker)
+        //   Message (assistant response)
+        //   Map with "blocks" (List<ContentBlockParam>) + "tools" (List<String>) + "ids" (List<String>)
+        List<Integer> toolResultTurnIndices = new ArrayList<>();
+        for (int i = 0; i < history.size(); i++) {
+            if (history.get(i) instanceof Map<?,?> map && map.containsKey("tools")) {
+                toolResultTurnIndices.add(i);
+            }
+        }
+        if (toolResultTurnIndices.size() <= KEEP_RECENT) return;
+
+        for (int t = 0; t < toolResultTurnIndices.size() - KEEP_RECENT; t++) {
+            int idx = toolResultTurnIndices.get(t);
+            Map<String,Object> turnInfo = (Map<String,Object>) history.get(idx);
+            List<String> toolNames = (List<String>) turnInfo.get("tools");
+            List<String> toolUseIds = (List<String>) turnInfo.get("ids");
+
+            // 检查是否所有工具都是保留工具
+            boolean allPreserved = true;
+            for (String tn : toolNames) {
+                if (!PRESERVE_RESULT_TOOLS.contains(tn)) { allPreserved = false; break; }
+            }
+            if (allPreserved) continue;
+
+            // 重建 blocks：保留的保持原样，不保留的替换为短摘要
+            List<ContentBlockParam> originalBlocks = (List<ContentBlockParam>) turnInfo.get("blocks");
+            List<ContentBlockParam> compacted = new ArrayList<>();
+            int toolIdx = 0;
+            for (ContentBlockParam cbp : originalBlocks) {
+                if (toolIdx < toolNames.size() && cbp.isToolResult()) {
+                    String toolName = toolNames.get(toolIdx);
+                    String toolUseId = toolUseIds.get(toolIdx);
+                    if (PRESERVE_RESULT_TOOLS.contains(toolName)) {
+                        compacted.add(cbp);
+                    } else {
+                        compacted.add(ContentBlockParam.ofToolResult(
+                            ToolResultBlockParam.builder().toolUseId(toolUseId)
+                                .content("[Previous: used " + toolName + "]").build()));
+                    }
+                    toolIdx++;
+                } else {
+                    compacted.add(cbp);
+                }
+            }
+            turnInfo.put("blocks", compacted);
+        }
+    }
+
+    /** 从消息历史重建 paramsBuilder */
+    @SuppressWarnings("unchecked")
+    private static void rebuildFromHistory(List<Object> history) {
+        paramsBuilder = MessageCreateParams.builder().model(modelId).maxTokens(MAX_TOKENS).system(systemPrompt);
+        for (Tool t : fullTools) paramsBuilder.addTool(t);
+        for (Object entry : history) {
+            if (entry instanceof String s) {
+                if ("__ack_bg__".equals(s)) { paramsBuilder.addAssistantMessage("Noted background results."); }
+                else if ("__ack_inbox__".equals(s)) { paramsBuilder.addAssistantMessage("Noted inbox messages."); }
+                else { paramsBuilder.addUserMessage(s); }
+            } else if (entry instanceof Message m) {
+                paramsBuilder.addMessage(m);
+            } else if (entry instanceof Map<?,?> map) {
+                List<ContentBlockParam> blocks = (List<ContentBlockParam>) map.get("blocks");
+                paramsBuilder.addUserMessageOfBlockParams(blocks);
+            }
         }
     }
 
@@ -273,8 +375,8 @@ public class SFullAgent {
 
     private static void registerDispatchers(Map<String, java.util.function.Function<Map<String, Object>, String>> dispatch) {
         // 基础工具（s02）
-        dispatch.put("bash", input -> runBash((String) input.get("command")));
-        dispatch.put("read_file", input -> runRead((String) input.get("path"), input.get("limit") instanceof Number n ? n.intValue() : null));
+        dispatch.put("bash", input -> runBash((String) input.get("command"), (String) input.getOrDefault("_tool_use_id", "")));
+        dispatch.put("read_file", input -> runRead((String) input.get("path"), input.get("limit") instanceof Number n ? n.intValue() : null, (String) input.getOrDefault("_tool_use_id", "")));
         dispatch.put("write_file", input -> runWrite((String) input.get("path"), (String) input.get("content")));
         dispatch.put("edit_file", input -> runEdit((String) input.get("path"), (String) input.get("old_text"), (String) input.get("new_text")));
         // 待办清单（s03）
@@ -372,7 +474,7 @@ public class SFullAgent {
                 // 7. 加载技能——专业知识注入（s05）
                 defineTool("load_skill", "Load specialized knowledge by name.", Map.of("name",Map.of("type","string")), List.of("name")),
                 // 8. 手动触发对话压缩（s06）
-                defineTool("compress", "Manually compress conversation context.", Map.of(), null),
+                defineTool("compress", "Manually compress conversation context.", Map.of("focus",Map.of("type","string")), null),
                 // 9. 后台执行命令（s13）
                 defineTool("background_run", "Run command in background thread.", Map.of("command",Map.of("type","string"),"timeout",Map.of("type","integer")), List.of("command")),
                 // 10. 检查后台任务状态（s13）
@@ -528,6 +630,7 @@ public class SFullAgent {
         MessageBus() { try { Files.createDirectories(INBOX_DIR); } catch (IOException ignored) {} }
 
         String send(String sender, String to, String content, String msgType, Map<String,Object> extra) {
+            if (!VALID_MSG_TYPES.contains(msgType)) return "Error: Invalid msg_type '"+msgType+"'";
             var msg = new LinkedHashMap<String,Object>(); msg.put("type",msgType); msg.put("from",sender); msg.put("content",content); msg.put("timestamp",System.currentTimeMillis()/1000.0);
             if (extra!=null) msg.putAll(extra);
             try (var w = new FileWriter(INBOX_DIR.resolve(to+".jsonl").toFile(), true)) { w.write(MAPPER.writeValueAsString(msg)+"\n"); } catch (IOException ignored) {}
@@ -559,8 +662,8 @@ public class SFullAgent {
         }
 
         var subHandlers = new LinkedHashMap<String, java.util.function.Function<Map<String,Object>,String>>();
-        subHandlers.put("bash", input -> runBash((String)input.get("command")));
-        subHandlers.put("read_file", input -> runRead((String)input.get("path"), null));
+        subHandlers.put("bash", input -> runBash((String)input.get("command"), ""));
+        subHandlers.put("read_file", input -> runRead((String)input.get("path"), null, ""));
         subHandlers.put("write_file", input -> runWrite((String)input.get("path"), (String)input.get("content")));
         subHandlers.put("edit_file", input -> runEdit((String)input.get("path"), (String)input.get("old_text"), (String)input.get("new_text")));
 
@@ -596,7 +699,7 @@ public class SFullAgent {
     // 3. 用摘要重建 paramsBuilder（替换整个历史）
     // 4. 重置 token 估算计数器
 
-    private static void doAutoCompact() {
+    private static void doAutoCompact(List<Object> history, String focus) {
         try {
             Files.createDirectories(TRANSCRIPT_DIR);
             Path transcriptPath = TRANSCRIPT_DIR.resolve("transcript_"+System.currentTimeMillis()+".jsonl");
@@ -605,9 +708,13 @@ public class SFullAgent {
             String convText = String.join("\n", conversationLog);
             if (convText.length() > 80000) convText = convText.substring(convText.length()-80000);
 
+            String summaryPrompt = "Summarize this conversation for continuity. Structure:\n1) Task overview\n2) Current state\n3) Key decisions\n4) Next steps\n5) Context to preserve\nBe concise.\n";
+            if (focus != null && !focus.isBlank()) summaryPrompt += "Pay special attention to: " + focus + "\n";
+            summaryPrompt += "\n" + convText;
+
             Message summaryResp = client.messages().create(MessageCreateParams.builder()
                     .model(modelId).maxTokens(4000)
-                    .addUserMessage("Summarize this conversation for continuity. Structure:\n1) Task overview\n2) Current state\n3) Key decisions\n4) Next steps\n5) Context to preserve\nBe concise.\n\n"+convText)
+                    .addUserMessage(summaryPrompt)
                     .build());
 
             var summarySb = new StringBuilder();
@@ -615,6 +722,10 @@ public class SFullAgent {
             String summary = summarySb.toString();
 
             String continuation = "This session is continued from a previous conversation.\n\n"+summary+"\n\nPlease continue without asking further questions.";
+
+            // 用摘要重建历史
+            history.clear();
+            history.add(continuation);
 
             paramsBuilder = MessageCreateParams.builder().model(modelId).maxTokens(MAX_TOKENS).system(systemPrompt);
             for (Tool t : fullTools) paramsBuilder.addTool(t);
@@ -665,7 +776,7 @@ public class SFullAgent {
         try (var s = Files.list(TASKS_DIR)) {
             var tasks = s.filter(p->p.getFileName().toString().matches("task_\\d+\\.json")).sorted().map(p->{try{return MAPPER.readValue(Files.readString(p),Map.class);}catch(Exception e){return null;}}).filter(Objects::nonNull).toList();
             if (tasks.isEmpty()) return "No tasks."; var lines = new ArrayList<String>();
-            for (var t : tasks) { String m = switch((String)t.getOrDefault("status","?")){case "pending"->"[ ]";case "in_progress"->"[>]";case "completed"->"[x]";default->"[?]";}; String o = t.get("owner")!=null && !t.get("owner").toString().isEmpty() ? " @"+t.get("owner") : ""; lines.add(m+" #"+t.get("id")+": "+t.get("subject")+o); }
+            for (var t : tasks) { String m = switch((String)t.getOrDefault("status","?")){case "pending"->"[ ]";case "in_progress"->"[>]";case "completed"->"[x]";default->"[?]";}; String o = t.get("owner")!=null && !t.get("owner").toString().isEmpty() ? " @"+t.get("owner") : ""; @SuppressWarnings("unchecked") var bb=(List<Integer>)t.getOrDefault("blockedBy",List.of()); String blocked=!bb.isEmpty()?" (blocked by: "+bb+")":""; lines.add(m+" #"+t.get("id")+": "+t.get("subject")+o+blocked); }
             return String.join("\n",lines);
         } catch (IOException e) { return "Error: "+e.getMessage(); }
     }
@@ -747,8 +858,8 @@ public class SFullAgent {
         params.addUserMessage(prompt);
 
         var disp = new LinkedHashMap<String,java.util.function.Function<Map<String,Object>,String>>();
-        disp.put("bash", input -> runBash((String)input.get("command")));
-        disp.put("read_file", input -> runRead((String)input.get("path"),null));
+        disp.put("bash", input -> runBash((String)input.get("command"), (String)input.getOrDefault("_tool_use_id","")));
+        disp.put("read_file", input -> runRead((String)input.get("path"),null, (String)input.getOrDefault("_tool_use_id","")));
         disp.put("write_file", input -> runWrite((String)input.get("path"),(String)input.get("content")));
         disp.put("edit_file", input -> runEdit((String)input.get("path"),(String)input.get("old_text"),(String)input.get("new_text")));
         disp.put("send_message", input -> bus.send(name,(String)input.get("to"),(String)input.get("content"),"message",null));
@@ -767,7 +878,9 @@ public class SFullAgent {
                         if (!block.isToolUse()) continue; ToolUseBlock tu = block.asToolUse();
                         if ("idle".equals(tu.name())) { idleRequested=true; String out="Entering idle phase."; System.out.println(ANSI_DIM+"  ["+name+"] idle: "+out+ANSI_RESET); results.add(ContentBlockParam.ofToolResult(ToolResultBlockParam.builder().toolUseId(tu.id()).content(out).build())); continue; }
                         @SuppressWarnings("unchecked") Map<String,Object> in = (Map<String,Object>)jsonValueToObject(tu._input());
-                        var h=disp.get(tu.name()); String out; try{out=h!=null?h.apply(in!=null?in:Map.of()):"Unknown";}catch(Exception e){out="Error: "+e.getMessage();}
+                        if (in==null) in=new LinkedHashMap<>(); else if (!(in instanceof LinkedHashMap)) in=new LinkedHashMap<>(in);
+                        in.put("_tool_use_id", tu.id());
+                        var h=disp.get(tu.name()); String out; try{out=h!=null?h.apply(in):"Unknown";}catch(Exception e){out="Error: "+e.getMessage();}
                         System.out.println(ANSI_DIM+"  ["+name+"] "+tu.name()+": "+out.substring(0,Math.min(120,out.length()))+ANSI_RESET);
                         results.add(ContentBlockParam.ofToolResult(ToolResultBlockParam.builder().toolUseId(tu.id()).content(out).build()));
                     }
@@ -808,25 +921,66 @@ public class SFullAgent {
 
     private static Path safePath(String p) { Path r=WORKDIR.resolve(p).normalize().toAbsolutePath(); if(!r.startsWith(WORKDIR)) throw new IllegalArgumentException("Path escapes workspace: "+p); return r; }
 
-    private static String runBash(String cmd) {
+    private static String runBash(String cmd, String toolUseId) {
         if (cmd==null||cmd.isBlank()) return "Error: command required";
         for (String d: List.of("rm -rf /","sudo","shutdown","reboot","> /dev/")) if (cmd.contains(d)) return "Error: Dangerous command blocked";
         try { ProcessBuilder pb=System.getProperty("os.name").toLowerCase().contains("win") ? new ProcessBuilder("cmd","/c",cmd) : new ProcessBuilder("bash","-c",cmd);
             pb.directory(WORKDIR.toFile()).redirectErrorStream(true); Process p=pb.start();
             String o=new String(p.getInputStream().readAllBytes()).trim(); if (!p.waitFor(BASH_TIMEOUT_SECONDS,TimeUnit.SECONDS)){p.destroyForcibly();return "Error: Timeout";}
-            if (o.isEmpty()) return "(no output)"; return o.length()>MAX_OUTPUT ? o.substring(0,MAX_OUTPUT) : o;
+            if (o.isEmpty()) return "(no output)"; if (o.length()>MAX_OUTPUT) o=o.substring(0,MAX_OUTPUT);
+            return maybePersistOutput(toolUseId, o, PERSIST_TRIGGER_BASH);
         } catch (Exception e) { return "Error: "+e.getMessage(); }
     }
 
-    private static String runRead(String path, Integer limit) {
+    private static String runRead(String path, Integer limit, String toolUseId) {
         try { var lines=Files.readAllLines(safePath(path)); if (limit!=null && limit<lines.size()) { lines=new ArrayList<>(lines.subList(0,limit)); lines.add("... ("+(lines.size()-limit)+" more)"); }
-            String r=String.join("\n",lines); return r.length()>MAX_OUTPUT ? r.substring(0,MAX_OUTPUT) : r;
+            String r=String.join("\n",lines); if (r.length()>MAX_OUTPUT) r=r.substring(0,MAX_OUTPUT);
+            return maybePersistOutput(toolUseId, r, PERSIST_TRIGGER_DEFAULT);
         } catch (Exception e) { return "Error: "+e.getMessage(); }
     }
 
-    private static String runWrite(String path, String content) { try { Path fp=safePath(path); Files.createDirectories(fp.getParent()); Files.writeString(fp,content); return "Wrote "+content.length()+" bytes"; } catch (Exception e) { return "Error: "+e.getMessage(); } }
+    private static String runWrite(String path, String content) { try { Path fp=safePath(path); Files.createDirectories(fp.getParent()); Files.writeString(fp,content); return "Wrote "+content.length()+" bytes to "+path; } catch (Exception e) { return "Error: "+e.getMessage(); } }
 
     private static String runEdit(String path, String oldT, String newT) { try { Path fp=safePath(path); String c=Files.readString(fp); if (!c.contains(oldT)) return "Error: Text not found"; int idx=c.indexOf(oldT); Files.writeString(fp,c.substring(0,idx)+newT+c.substring(idx+oldT.length())); return "Edited "+path; } catch (Exception e) { return "Error: "+e.getMessage(); } }
+
+    // ---- Persisted Output ----
+
+    private static String formatSize(int size) {
+        if (size < 1024) return size + "B";
+        if (size < 1024*1024) return String.format("%.1fKB", size/1024.0);
+        return String.format("%.1fMB", size/(1024.0*1024));
+    }
+
+    private static String previewSlice(String text, int limit) {
+        if (text.length() <= limit) return text;
+        int cut = text.lastIndexOf('\n', limit);
+        if (cut < limit / 2) cut = limit;
+        return text.substring(0, cut) + "\n... (" + formatSize(text.length()) + " total, truncated)";
+    }
+
+    private static Path persistToolResult(String toolUseId, String content) {
+        try {
+            Files.createDirectories(TOOL_RESULTS_DIR);
+            String filename = toolUseId.replaceAll("[^a-zA-Z0-9_-]", "_") + ".txt";
+            Path stored = TOOL_RESULTS_DIR.resolve(filename);
+            Files.writeString(stored, content);
+            return stored;
+        } catch (Exception e) { return null; }
+    }
+
+    private static String buildPersistedMarker(Path storedPath, String content) {
+        String relPath = WORKDIR.relativize(storedPath).toString().replace('\\', '/');
+        String preview = previewSlice(content, PERSISTED_PREVIEW_CHARS);
+        return "<persisted-output path=\"" + relPath + "\" size=\"" + formatSize(content.length()) + "\">\n"
+                + preview + "\n</persisted-output>";
+    }
+
+    private static String maybePersistOutput(String toolUseId, String output, int triggerChars) {
+        if (toolUseId == null || toolUseId.isEmpty() || output.length() <= triggerChars) return output;
+        Path stored = persistToolResult(toolUseId, output);
+        if (stored == null) return output;
+        return buildPersistedMarker(stored, output);
+    }
 
     @SuppressWarnings("unchecked")
     private static Object jsonValueToObject(JsonValue value) {
