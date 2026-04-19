@@ -374,12 +374,81 @@ Java 实现还额外加了**停滞检测**（`detectStalled`）：运行超过 4
 
 ## 试一试
 
+### 启动
+
 ```sh
 cd mini-agent-4j
 mvn compile exec:java -Dexec.mainClass="com.example.agent.sessions.S13BackgroundTasks"
 ```
 
-1. `在后台运行 "mvn dependency:resolve"`
-2. `趁它运行的时候，列出项目文件`
-3. `检查后台任务状态`
-4. `在后台运行 "find . -name '*.java'" 并继续工作`
+启动时确认 `.runtime-tasks/` 目录被自动创建。
+
+### 案例 1：后台启动 + 立即返回 task_id
+
+> 让 agent 在后台运行一个慢命令，验证 background_run 立即返回。
+
+```
+在后台运行 "mvn dependency:resolve"
+```
+
+观察要点：
+- 模型调用 `> background_run:` 工具，返回类似 `Background task a1b2c3d4 started: mvn dependency:resolve (output_file=.runtime-tasks/a1b2c3d4.log)`
+- 返回是**立即的**，不需要等待 mvn 执行完毕
+- `.runtime-tasks/` 目录下生成了 `a1b2c3d4.json`（任务记录，status=running）和 `a1b2c3d4.log`（输出文件，暂时为空）
+
+### 案例 2：并行工作 + 通知 drain 回注
+
+> 在后台任务运行期间继续做别的工作，观察下一轮 LLM 调用前通知被注入。
+
+紧接案例 1，趁后台运行时继续提问：
+
+```
+帮我列出 src/main/java/com/example/agent/sessions/ 下的文件
+```
+
+观察要点：
+- 模型正常调用 `> bash:` 或 `> read_file:` 完成文件列表任务，**不被后台命令阻塞**
+- 如果后台任务在这期间完成，日志出现黄色通知：`[bg:a1b2c3d4] completed: BUILD SUCCESS ... (output_file=.runtime-tasks/a1b2c3d4.log)`
+- 这是 `drain()` 机制在工作：每次 LLM 调用前，从通知队列取出结果并注入 `<background-results>` 标签
+- `.runtime-tasks/a1b2c3d4.log` 文件现在包含完整输出
+
+### 案例 3：check_background 查询状态
+
+> 用 check_background 分别查询单个任务和全部任务，验证不同返回格式。
+
+先查询特定任务：
+
+```
+检查后台任务 a1b2c3d4 的状态
+```
+
+观察要点：
+- 模型调用 `> check_background:` 传入 task_id
+- 单任务返回 **JSON 格式**，包含 `id`、`status`、`command`、`result_preview`、`output_file` 字段
+- 如果任务已完成，`status` 为 `"completed"`，`result_preview` 是压缩空白后的摘要
+
+再查询全部：
+
+```
+列出所有后台任务
+```
+
+观察要点：
+- 模型调用 `> check_background:` 不传 task_id（或传 null）
+- 列表格式：`taskId: [status] command -> result_preview`
+- 已完成的任务显示预览摘要，运行中的显示 `(running)`
+
+### 案例 4：磁盘持久化 + 输出文件验证
+
+> 验证后台任务的磁盘持久化结构，理解"通知负责提醒，文件负责存原文"的设计。
+
+```
+在后台运行 "mvn help:effective-pom"，等它完成后读取输出文件
+```
+
+观察要点：
+- `background_run` 返回 `output_file=.runtime-tasks/XXXX.log`
+- 后台任务完成后，通知中包含 `(output_file=...)` 路径
+- 模型可调用 `> read_file:` 读取 `.runtime-tasks/XXXX.log` 查看完整输出（不受 500 字符预览限制）
+- `.runtime-tasks/XXXX.json` 中 `status` 为 `"completed"`，`result_preview` 是压缩后的摘要，`finished_at` 有值
+- 这验证了三层分离：通知（短摘要）→ 任务记录（JSON 元数据）→ 输出文件（完整原文）
