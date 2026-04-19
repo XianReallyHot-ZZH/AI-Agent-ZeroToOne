@@ -61,8 +61,55 @@ public class S17AutonomousAgents {
     private static String modelId;
 
     // ---- 协议状态 ----
-    private static final ConcurrentHashMap<String, Map<String, Object>> shutdownRequests = new ConcurrentHashMap<>();
-    private static final ConcurrentHashMap<String, Map<String, Object>> planRequests = new ConcurrentHashMap<>();
+    private static RequestStore requestStore;
+
+    private static final Set<String> VALID_MSG_TYPES = Set.of(
+            "message", "broadcast", "shutdown_request", "shutdown_response",
+            "plan_approval", "plan_approval_response");
+
+    /** 协议请求持久化存储（.team/requests/{request_id}.json）。 */
+    public static class RequestStore {
+        private final Path dir;
+        private final Object lock = new Object();
+
+        public RequestStore(Path baseDir) {
+            this.dir = baseDir;
+            try { Files.createDirectories(dir); } catch (IOException ignored) {}
+        }
+
+        private Path path(String requestId) { return dir.resolve(requestId + ".json"); }
+
+        @SuppressWarnings("unchecked")
+        public Map<String, Object> create(Map<String, Object> record) {
+            String requestId = (String) record.get("request_id");
+            synchronized (lock) {
+                try { Files.writeString(path(requestId), MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(record)); }
+                catch (IOException e) { throw new RuntimeException(e); }
+            }
+            return record;
+        }
+
+        @SuppressWarnings("unchecked")
+        public Map<String, Object> get(String requestId) {
+            Path p = path(requestId);
+            if (!Files.exists(p)) return null;
+            try { return MAPPER.readValue(Files.readString(p), Map.class); }
+            catch (IOException e) { return null; }
+        }
+
+        @SuppressWarnings("unchecked")
+        public Map<String, Object> update(String requestId, Map<String, Object> changes) {
+            synchronized (lock) {
+                Map<String, Object> record = get(requestId);
+                if (record == null) return null;
+                record.putAll(changes);
+                record.put("updated_at", System.currentTimeMillis() / 1000.0);
+                try { Files.writeString(path(requestId), MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(record)); }
+                catch (IOException e) { throw new RuntimeException(e); }
+                return record;
+            }
+        }
+    }
 
     // ---- 团队状态 ----
     private static Map<String, Object> teamConfig;
@@ -82,6 +129,7 @@ public class S17AutonomousAgents {
 
         client = buildClient(apiKey, baseUrl);
         bus = new MessageBus();
+        requestStore = new RequestStore(TEAM_DIR.resolve("requests"));
         teamConfig = loadTeamConfig();
         try { Files.createDirectories(TASKS_DIR); } catch (IOException ignored) {}
 
@@ -97,7 +145,7 @@ public class S17AutonomousAgents {
                 defineTool("edit_file", "Replace exact text.", Map.of("path", Map.of("type", "string"), "old_text", Map.of("type", "string"), "new_text", Map.of("type", "string")), List.of("path", "old_text", "new_text")),
                 defineTool("spawn_teammate", "Spawn an autonomous teammate.", Map.of("name", Map.of("type", "string"), "role", Map.of("type", "string"), "prompt", Map.of("type", "string")), List.of("name", "role", "prompt")),
                 defineTool("list_teammates", "List all teammates.", Map.of(), null),
-                defineTool("send_message", "Send message to teammate.", Map.of("to", Map.of("type", "string"), "content", Map.of("type", "string"), "msg_type", Map.of("type", "string", "enum", List.of("message", "broadcast", "shutdown_request", "shutdown_response", "plan_approval_response"))), List.of("to", "content")),
+                defineTool("send_message", "Send message to teammate.", Map.of("to", Map.of("type", "string"), "content", Map.of("type", "string"), "msg_type", Map.of("type", "string", "enum", List.of("message", "broadcast", "shutdown_request", "shutdown_response", "plan_approval", "plan_approval_response"))), List.of("to", "content")),
                 defineTool("read_inbox", "Read lead inbox.", Map.of(), null),
                 defineTool("broadcast", "Broadcast to all teammates.", Map.of("content", Map.of("type", "string")), List.of("content")),
                 defineTool("shutdown_request", "Request teammate shutdown.", Map.of("teammate", Map.of("type", "string")), List.of("teammate")),
@@ -122,7 +170,7 @@ public class S17AutonomousAgents {
         handlers.put("shutdown_response", input -> checkShutdownStatus((String) input.get("request_id")));
         handlers.put("plan_approval", input -> handlePlanReview((String) input.get("request_id"), Boolean.TRUE.equals(input.get("approve")), (String) input.get("feedback")));
         handlers.put("idle", input -> "Lead does not idle.");
-        handlers.put("claim_task", input -> claimTask(((Number) input.get("task_id")).intValue(), "lead"));
+        handlers.put("claim_task", input -> claimTask(((Number) input.get("task_id")).intValue(), "lead", null, "manual"));
 
         // ---- REPL ----
         MessageCreateParams.Builder paramsBuilder = MessageCreateParams.builder()
@@ -192,6 +240,8 @@ public class S17AutonomousAgents {
         MessageBus() { try { Files.createDirectories(INBOX_DIR); } catch (IOException ignored) {} }
 
         String send(String sender, String to, String content, String msgType, Map<String, Object> extra) {
+            if (!VALID_MSG_TYPES.contains(msgType))
+                return "Error: Invalid type '" + msgType + "'. Valid: " + VALID_MSG_TYPES;
             var msg = new LinkedHashMap<String, Object>();
             msg.put("type", msgType); msg.put("from", sender); msg.put("content", content);
             msg.put("timestamp", System.currentTimeMillis() / 1000.0);
@@ -257,7 +307,7 @@ public class S17AutonomousAgents {
                 defineTool("read_file", "Read file.", Map.of("path", Map.of("type", "string")), List.of("path")),
                 defineTool("write_file", "Write file.", Map.of("path", Map.of("type", "string"), "content", Map.of("type", "string")), List.of("path", "content")),
                 defineTool("edit_file", "Edit file.", Map.of("path", Map.of("type", "string"), "old_text", Map.of("type", "string"), "new_text", Map.of("type", "string")), List.of("path", "old_text", "new_text")),
-                defineTool("send_message", "Send message.", Map.of("to", Map.of("type", "string"), "content", Map.of("type", "string"), "msg_type", Map.of("type", "string", "enum", List.of("message", "broadcast", "shutdown_request", "shutdown_response", "plan_approval_response"))), List.of("to", "content")),
+                defineTool("send_message", "Send message.", Map.of("to", Map.of("type", "string"), "content", Map.of("type", "string"), "msg_type", Map.of("type", "string", "enum", List.of("message", "broadcast", "shutdown_request", "shutdown_response", "plan_approval", "plan_approval_response"))), List.of("to", "content")),
                 defineTool("read_inbox", "Read inbox.", Map.of(), null),
                 defineTool("shutdown_response", "Respond to shutdown.", Map.of("request_id", Map.of("type", "string"), "approve", Map.of("type", "boolean"), "reason", Map.of("type", "string")), List.of("request_id", "approve")),
                 defineTool("plan_approval", "Submit plan.", Map.of("plan", Map.of("type", "string")), List.of("plan")),
@@ -279,19 +329,34 @@ public class S17AutonomousAgents {
             String reqId = (String) input.get("request_id");
             boolean approve = Boolean.TRUE.equals(input.get("approve"));
             String reason = (String) input.getOrDefault("reason", "");
-            var req = shutdownRequests.get(reqId);
-            if (req != null) req.put("status", approve ? "approved" : "rejected");
+
+            String status = approve ? "approved" : "rejected";
+            Map<String, Object> changes = new LinkedHashMap<>();
+            changes.put("status", status);
+            changes.put("resolved_by", name);
+            changes.put("resolved_at", System.currentTimeMillis() / 1000.0);
+            changes.put("response", Map.of("approve", approve, "reason", reason));
+            var updated = requestStore.update(reqId, changes);
+            if (updated == null) return "Error: Unknown shutdown request " + reqId;
+
             bus.send(name, "lead", reason, "shutdown_response", Map.of("request_id", reqId, "approve", approve));
             return "Shutdown " + (approve ? "approved" : "rejected");
         });
         dispatch.put("plan_approval", input -> {
-            String planText = (String) input.get("plan");
+            String planText = (String) input.getOrDefault("plan", "");
             String reqId = UUID.randomUUID().toString().substring(0, 8);
-            planRequests.put(reqId, new ConcurrentHashMap<>(Map.of("from", name, "plan", planText, "status", "pending")));
-            bus.send(name, "lead", planText, "plan_approval_response", Map.of("request_id", reqId, "plan", planText));
+            double now = System.currentTimeMillis() / 1000.0;
+
+            requestStore.create(new LinkedHashMap<>(Map.of(
+                    "request_id", reqId, "kind", "plan_approval",
+                    "from", name, "to", "lead", "status", "pending",
+                    "plan", planText, "created_at", now, "updated_at", now)));
+
+            bus.send(name, "lead", planText, "plan_approval",
+                    Map.of("request_id", reqId, "plan", planText));
             return "Plan submitted (request_id=" + reqId + "). Waiting for approval.";
         });
-        dispatch.put("claim_task", input -> claimTask(((Number) input.get("task_id")).intValue(), name));
+        dispatch.put("claim_task", input -> claimTask(((Number) input.get("task_id")).intValue(), name, role, "manual"));
         // idle 在工作阶段内联拦截，不注册到分发
 
         // ==================== 持久化生命周期：work → idle → work ====================
@@ -337,7 +402,7 @@ public class S17AutonomousAgents {
                     if (idleRequested) break;
                 } catch (Exception e) {
                     System.out.println(ANSI_DIM + "  [" + name + "] error: " + e.getMessage() + ANSI_RESET);
-                    setMemberStatus(name, "shutdown"); return;
+                    setMemberStatus(name, "idle"); return;
                 }
             }
 
@@ -352,6 +417,9 @@ public class S17AutonomousAgents {
                 // 检查收件箱
                 var inbox = bus.readInbox(name);
                 if (!inbox.isEmpty()) {
+                    // 身份再注入
+                    paramsBuilder.addUserMessage("<identity>You are '" + name + "', role: " + role + ", team: " + teamName + ".</identity>");
+                    paramsBuilder.addAssistantMessage("I am " + name + ". Continuing.");
                     for (var msg : inbox) {
                         if ("shutdown_request".equals(msg.get("type"))) { setMemberStatus(name, "shutdown"); return; }
                         try { paramsBuilder.addUserMessage(MAPPER.writeValueAsString(msg)); } catch (Exception ignored) {}
@@ -368,13 +436,14 @@ public class S17AutonomousAgents {
                 if (!unclaimed.isEmpty()) {
                     var task = unclaimed.get(0);
                     int taskId = ((Number) task.get("id")).intValue();
-                    claimTask(taskId, name);
+                    String claimResult = claimTask(taskId, name, role, "auto");
+                    if (claimResult.startsWith("Error:")) continue;
 
                     // 身份再注入
                     paramsBuilder.addUserMessage("<identity>You are '" + name + "', role: " + role + ", team: " + teamName + ".</identity>");
                     paramsBuilder.addAssistantMessage("I am " + name + ". Continuing.");
                     paramsBuilder.addUserMessage("<auto-claimed>Task #" + task.get("id") + ": " + task.get("subject") + "\n" + task.getOrDefault("description", "") + "</auto-claimed>");
-                    paramsBuilder.addAssistantMessage("Claimed task #" + taskId + ". Working on it.");
+                    paramsBuilder.addAssistantMessage(claimResult + ". Working on it.");
                     resume = true; break;
                 }
             }
@@ -434,8 +503,11 @@ public class S17AutonomousAgents {
                     if (!"pending".equals(t.get("status"))) continue;
                     if (t.get("owner") != null && !t.get("owner").toString().isEmpty()) continue;
                     if (!((List<?>) t.getOrDefault("blockedBy", List.of())).isEmpty()) continue;
-                    // 角色过滤：required_role 为空时所有角色都可认领，否则精确匹配
-                    String requiredRole = t.get("required_role") != null ? t.get("required_role").toString() : "";
+                    // 角色过滤：支持 claim_role 和 required_role 两种字段名
+                    String requiredRole = "";
+                    Object cr = t.get("claim_role"), rr = t.get("required_role");
+                    if (cr != null && !cr.toString().isEmpty()) requiredRole = cr.toString();
+                    else if (rr != null && !rr.toString().isEmpty()) requiredRole = rr.toString();
                     if (!requiredRole.isEmpty() && !requiredRole.equals(role)) continue;
                     result.add(t);
                 } catch (Exception ignored) {}
@@ -445,14 +517,40 @@ public class S17AutonomousAgents {
     }
 
     @SuppressWarnings("unchecked")
-    private static synchronized String claimTask(int taskId, String owner) {
+    private static synchronized String claimTask(int taskId, String owner, String role, String source) {
         Path p = TASKS_DIR.resolve("task_" + taskId + ".json");
         if (!Files.exists(p)) return "Error: Task " + taskId + " not found";
         try {
             var t = MAPPER.readValue(Files.readString(p), Map.class);
-            t.put("owner", owner); t.put("status", "in_progress");
+            // 角色验证
+            if (!"pending".equals(t.get("status"))) return "Error: Task " + taskId + " is not claimable for role=" + (role != null ? role : "(any)");
+            if (t.get("owner") != null && !t.get("owner").toString().isEmpty()) return "Error: Task " + taskId + " is not claimable for role=" + (role != null ? role : "(any)");
+            String requiredRole = "";
+            Object cr = t.get("claim_role"), rr = t.get("required_role");
+            if (cr != null && !cr.toString().isEmpty()) requiredRole = cr.toString();
+            else if (rr != null && !rr.toString().isEmpty()) requiredRole = rr.toString();
+            if (!requiredRole.isEmpty() && !requiredRole.equals(role != null ? role : ""))
+                return "Error: Task " + taskId + " is not claimable for role=" + (role != null ? role : "(any)");
+
+            t.put("owner", owner);
+            t.put("status", "in_progress");
+            t.put("claimed_at", System.currentTimeMillis() / 1000.0);
+            t.put("claim_source", source != null ? source : "manual");
             Files.writeString(p, MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(t));
-            return "Claimed task #" + taskId + " for " + owner;
+
+            // 写入 claim 事件日志
+            Path claimEvents = TASKS_DIR.resolve("claim_events.jsonl");
+            var event = new LinkedHashMap<String, Object>();
+            event.put("event", "task.claimed");
+            event.put("task_id", taskId);
+            event.put("owner", owner);
+            event.put("role", role);
+            event.put("source", source);
+            event.put("ts", System.currentTimeMillis() / 1000.0);
+            Files.writeString(claimEvents, MAPPER.writeValueAsString(event) + "\n",
+                    StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+
+            return "Claimed task #" + taskId + " for " + owner + " via " + (source != null ? source : "manual");
         } catch (IOException e) { return "Error: " + e.getMessage(); }
     }
 
@@ -496,24 +594,35 @@ public class S17AutonomousAgents {
 
     private static String handleShutdownRequest(String teammate) {
         String reqId = UUID.randomUUID().toString().substring(0, 8);
-        shutdownRequests.put(reqId, new ConcurrentHashMap<>(Map.of("target", teammate, "status", "pending")));
-        bus.send("lead", teammate, "Please shut down.", "shutdown_request", Map.of("request_id", reqId));
+        double now = System.currentTimeMillis() / 1000.0;
+        requestStore.create(new LinkedHashMap<>(Map.of(
+                "request_id", reqId, "kind", "shutdown",
+                "from", "lead", "to", teammate, "status", "pending",
+                "created_at", now, "updated_at", now)));
+        bus.send("lead", teammate, "Please shut down gracefully.", "shutdown_request", Map.of("request_id", reqId));
         return "Shutdown request " + reqId + " sent to '" + teammate + "'";
     }
 
     private static String checkShutdownStatus(String reqId) {
-        var req = shutdownRequests.get(reqId);
+        var req = requestStore.get(reqId);
         if (req == null) return "{\"error\": \"not found\"}";
         try { return MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(req); } catch (Exception e) { return req.toString(); }
     }
 
     private static String handlePlanReview(String reqId, boolean approve, String feedback) {
-        var req = planRequests.get(reqId);
+        var req = requestStore.get(reqId);
         if (req == null) return "Error: Unknown plan request_id '" + reqId + "'";
-        req.put("status", approve ? "approved" : "rejected");
-        bus.send("lead", (String) req.get("from"), feedback != null ? feedback : "", "plan_approval_response",
-                Map.of("request_id", reqId, "approve", approve, "feedback", feedback != null ? feedback : ""));
-        return "Plan " + req.get("status") + " for '" + req.get("from") + "'";
+        String status = approve ? "approved" : "rejected";
+        String fb = feedback != null ? feedback : "";
+        Map<String, Object> changes = new LinkedHashMap<>();
+        changes.put("status", status);
+        changes.put("reviewed_by", "lead");
+        changes.put("resolved_at", System.currentTimeMillis() / 1000.0);
+        changes.put("feedback", fb);
+        requestStore.update(reqId, changes);
+        bus.send("lead", (String) req.get("from"), fb, "plan_approval_response",
+                Map.of("request_id", reqId, "approve", approve, "feedback", fb));
+        return "Plan " + status + " for '" + req.get("from") + "'";
     }
 
     // ==================== 基础设施 ====================
