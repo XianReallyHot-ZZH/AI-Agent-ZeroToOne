@@ -357,15 +357,87 @@ Java 实现有两个教学范围之外但值得了解的增强：
 
 ## 试一试
 
+### 启动
+
 ```sh
 cd mini-agent-4j
 mvn compile exec:java -Dexec.mainClass="com.example.agent.sessions.S14CronScheduler"
 ```
 
-可以试试这些任务：
+启动时观察：`[CronLock] Acquired lock (PID ...)` + `[Cron scheduler running. Background checks every second.]`。
 
-1. 输入 `创建一个每分钟执行的定时任务，检查当前时间并报告`，观察它是否会按时进入通知队列。
-2. 创建一个一次性（one-shot）任务，确认触发后是否会自动消失。
-3. 创建一个 durable 任务，退出程序后重启，检查持久化的调度记录是否还在。
-4. 输入 `/cron` 查看所有调度任务。
-5. 输入 `/test` 手动触发一条测试通知，观察它如何注入对话。
+### 案例 1：创建循环定时任务 + /cron 查看
+
+> 让 agent 创建一个每分钟执行的定时任务，观察它按时触发并注入对话。
+
+```
+帮我创建一个每分钟执行的定时任务，任务是"报告当前时间和已完成的工作"
+```
+
+观察要点：
+- 模型调用 `> cron_create:` 工具，传入 `cron: "*/1 * * * *"`（或类似每分钟表达式）和 prompt
+- 返回类似 `Created task a1b2c3d4 (recurring, session-only): cron=*/1 * * * *`
+- 输入 `/cron` 查看任务列表，格式：`a1b2c3d4  */1 * * * *  [recurring/session] (0.0h old): 报告当前时间...`
+- 等待约 1 分钟，日志出现 `[Cron] Fired: a1b2c3d4`，随后黄色通知被注入对话
+- 模型收到通知后执行 prompt 要求的操作
+
+### 案例 2：一次性任务（one-shot）+ 自动删除
+
+> 创建一个只触发一次的任务，验证触发后自动从任务列表移除。
+
+先确认当前时间（假设现在是 14:05）：
+
+```
+帮我创建一个在下一分钟（比如 14:06）执行的一次性任务，内容是"提醒我检查编译结果"，只触发一次
+```
+
+观察要点：
+- 模型调用 `> cron_create:` 传入 `recurring: false`
+- 返回 `Created task XXXX (one-shot, session-only): cron=6 14 * * *`
+- 输入 `/cron` 确认任务存在
+- 等到 14:06，日志出现 `[Cron] Fired: XXXX`，紧接着 `[Cron] One-shot completed and removed: XXXX`
+- 再次 `/cron`，该任务**已消失**——一次性任务触发后自动删除
+
+### 案例 3：持久化任务（durable）+ 跨会话验证
+
+> 创建一个 durable 任务，退出重启后验证调度记录仍然存在。
+
+```
+帮我创建一个 durable 的定时任务，每天 9 点执行，内容是"运行 mvn test 并报告结果"
+```
+
+观察要点：
+- 模型调用 `> cron_create:` 传入 `durable: true`
+- 返回 `Created task XXXX (recurring, durable): cron=0 9 * * *`
+- 检查 `.claude/scheduled_tasks.json` 文件——包含该任务的完整记录（id、cron、prompt、recurring、durable、createdAt）
+- 退出程序（输入 `q`），再重新启动
+- 启动时显示 `[Cron] Loaded 1 scheduled tasks`——从磁盘自动加载 durable 任务
+- 输入 `/cron` 确认任务仍然存在
+
+### 案例 4：/test 手动通知 + cron_delete 删除
+
+> 用 /test 手动注入测试通知理解注入机制，然后删除一个任务。
+
+先测试通知注入：
+
+```
+/test
+```
+
+观察要点：
+- 输出 `[Test notification enqueued. It will be injected on your next message.]`
+- 通知**尚未**到达模型——它只是进入了队列
+- 输入任意下一条消息时，`agentLoop` 开头的 `drainNotifications()` 才会将通知作为 user 消息注入
+- 这是"先入队列，再在下一轮 LLM 调用前注入"的完整流程
+
+然后删除一个任务：
+
+```
+帮我删除定时任务 XXXX
+```
+
+观察要点：
+- 模型调用 `> cron_delete:` 传入任务 ID
+- 返回 `Deleted task XXXX`
+- 如果是 durable 任务，`.claude/scheduled_tasks.json` 文件同步更新（移除该条目）
+- `/cron` 确认任务已删除
