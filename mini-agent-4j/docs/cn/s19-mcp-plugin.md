@@ -529,6 +529,155 @@ REPL 命令：
 /mcp      # 显示已连接的 MCP 服务器
 ```
 
+## 试一试
+
+### 启动
+
+```sh
+cd mini-agent-4j
+mvn compile exec:java -Dexec.mainClass="com.example.agent.sessions.S19McpPlugin"
+```
+
+启动时确认输出 `[Tool pool: 4 tools (0 from MCP)]`（4 个原生工具，无插件时无 MCP 工具）。
+
+### 案例 1：原生工具 + 权限门（read 自动允许、write 需确认）
+
+> 使用原生工具感受权限门行为：只读操作自动执行，写操作需要用户确认。
+
+先触发一个只读工具：
+
+```
+读取 pom.xml 的前几行
+```
+
+再触发一个写操作：
+
+```
+在 /tmp 目录下创建一个文件 test-s19.txt，内容为 "hello s19"
+```
+
+最后触发一个高风险操作：
+
+```
+运行命令：rm -rf /tmp/test-s19.txt
+```
+
+观察要点：
+- `read_file` 调用时，权限门 `normalize()` 判定 `risk = "read"`，`check()` 返回 `behavior = "allow"`，不弹出确认提示，直接执行
+- `write_file` 调用时，`normalize()` 判定 `risk = "write"`（write 不在 READ_PREFIXES 或 HIGH_RISK_PREFIXES 中），`check()` 返回 `behavior = "ask"`，终端弹出确认：`[Permission] native:write_file risk=write: ...`
+- 用户输入 `y` → 执行写入，返回 `Wrote N bytes`；输入 `n` → 返回 `Permission denied by user`
+- `bash` 执行 `rm -rf` 命令时，`normalize()` 检测到 `"rm -rf /"` 在命令中（`DANGEROUS_COMMANDS` 匹配），判定 `risk = "high"`，弹出确认
+- 每个工具调用的结果都经过 `normalizeToolResult()` 标准化：包含 `source`、`tool`、`risk`、`status`（ok/error）、`preview` 字段
+- `> read_file:` 日志直接显示文件内容，无 `[Permission]` 前缀
+- `> write_file:` 和 `> bash:` 日志前出现权限确认提示
+
+### 案例 2：Plugin 清单 + /tools 和 /mcp 命令
+
+> 创建一个最小 plugin 清单，观察插件发现和工具池变化。
+
+先创建一个最小 plugin（仅供观察，不需要真正的 MCP 服务器可用）：
+
+```
+让 agent 用 write_file 创建 .claude-plugin/plugin.json，内容如下：
+{
+  "name": "demo-tools",
+  "version": "1.0.0",
+  "mcpServers": {
+    "echo": {
+      "command": "node",
+      "args": ["-e", "process.exit(0)"]
+    }
+  }
+}
+```
+
+退出程序后重新启动，观察启动日志。然后在 REPL 中使用管理命令：
+
+```
+/tools
+```
+
+```
+/mcp
+```
+
+观察要点：
+- 重新启动后，启动日志出现 `[Plugins loaded: demo-tools]`
+- 如果 MCP 服务器连接失败，日志显示 `[MCP] Connection failed: ...`（因为 `process.exit(0)` 不是真正的 MCP 服务器），但插件扫描本身成功
+- `/tools` 输出分两节：`Native tools:` 显示 4 个原生工具（bash、read_file、write_file、edit_file），`MCP tools:` 仅在服务器连接成功时显示
+- `/mcp` 在无服务器连接时显示 `(no MCP servers connected)`；有连接时显示服务器名和工具数量
+- 如果使用一个真正可用的 MCP 服务器（如 `npx -y @modelcontextprotocol/server-filesystem`），`/tools` 会额外显示 `mcp__{serverName}__{toolName}` 前缀的工具
+- `/mcp` 显示格式：`{serverName}: {N} tools`
+
+### 案例 3：MCP 工具调用 + 统一路由 + 权限门贯穿
+
+> 当 MCP 服务器可用时，验证 MCP 工具从命名、路由、权限到结果标准化都走同一条管线。
+
+> 注意：此案例需要一个可用的 MCP 服务器。推荐使用 `npx -y @modelcontextprotocol/server-filesystem /tmp`（需提前安装 Node.js）。
+
+在 `.claude-plugin/plugin.json` 中配置一个 filesystem MCP 服务器：
+
+```json
+{
+  "name": "fs-helper",
+  "version": "1.0.0",
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    }
+  }
+}
+```
+
+启动后确认连接成功，然后通过自然语言触发 MCP 工具：
+
+```
+列出 /tmp 目录下的文件
+```
+
+```
+读取 /tmp 下的某个文件内容
+```
+
+观察要点：
+- 启动日志显示 `[Plugins loaded: fs-helper]` 和 `[MCP] Connected to fs-helper__filesystem`
+- 工具池打印：`[Tool pool: N tools (M from MCP)]`，M > 0 表示 MCP 工具注册成功
+- 模型调用 `mcp__fs-helper__filesystem__list_directory`（或类似前缀名）时，`MCPToolRouter.isMcpTool()` 返回 true，路由到对应 MCPClient
+- 权限门对 MCP 工具同样生效：`normalize()` 解析 `mcp__` 前缀，提取 `source=mcp`、`server=fs-helper__filesystem`、`tool=list_directory`
+- `list_directory` 以 "list" 开头，`normalize()` 判定 `risk = "read"`，自动允许
+- `read_file` 类 MCP 工具判定 `risk = "read"`，同样自动允许
+- `normalizeToolResult()` 的输出中 `source = "mcp"`（不是 "native"），`server` 字段非空
+- 如果 MCP 调用失败（如文件不存在），结果包含 `"status": "error"`，`preview` 显示 `MCP Error: ...`
+
+### 案例 4：权限门风险等级全对比 + normalizeToolResult 审计
+
+> 用不同类型工具覆盖 read/write/high 三种风险等级，对比 normalizeToolResult 的输出差异。
+
+依次触发不同风险等级的操作：
+
+```
+读取 src 目录下任意一个 Java 文件的内容（read 风险）
+```
+
+```
+运行命令 ls src（bash 非危险命令，write 风险）
+```
+
+```
+运行命令 echo hello（bash 非危险命令，write 风险）
+```
+
+观察要点：
+- **read 级**（`read_file`）：`check()` 返回 `behavior = "allow"`，`reason = "Read capability"`，无确认提示，直接执行
+- **write 级**（`bash` + 非危险命令如 `ls`）：`check()` 返回 `behavior = "ask"`，`reason = "State-changing capability requires confirmation"`，弹出确认
+- **high 级**（`bash` + 危险命令如包含 `sudo`）：`check()` 返回 `behavior = "ask"`，`reason = "High-risk capability requires confirmation"`
+- 三种情况 `normalizeToolResult()` 输出的 JSON 结构一致：`source`、`server`（原生为 null）、`tool`、`risk`、`status`、`preview`
+- `risk` 字段值分别为 `"read"`、`"write"`、`"high"`，准确反映操作类型
+- `source` 对原生工具均为 `"native"`，对 MCP 工具（如有）为 `"mcp"`
+- 执行成功时 `status = "ok"`，输出含 "Error:" 时 `status = "error"`
+- `preview` 截取输出前 500 字符，保证结果格式统一不因来源不同而不同
+
 ## 变更对比（S18 -> S19）
 
 | 组件          | S18           | S19                                          |
