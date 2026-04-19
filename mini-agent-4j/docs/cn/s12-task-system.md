@@ -345,6 +345,90 @@ List<Tool> tools = List.of(
 
 如果这 4 件事都已经清楚，说明你已经能从 0 到 1 手写一个最小任务系统。
 
+## 试一试
+
+### 启动
+
+```sh
+cd mini-agent-4j
+mvn compile exec:java -Dexec.mainClass="com.example.agent.sessions.S12TaskSystem"
+```
+
+启动时确认 `.tasks/` 目录被自动创建。
+
+### 案例 1：任务创建与列表（基础 CRUD）
+
+> 让 agent 拆分一个目标，观察 task_create 和 task_list 的交互。
+
+```
+帮我规划一个"给项目添加日志功能"的任务，拆成 3 个步骤
+```
+
+观察要点：
+- 模型连续调用 `> task_create:` 创建 3 条任务，每次返回 JSON 记录（含 id、status="pending"）
+- 调用 `> task_list:` 输出任务板，每行格式 `[ ] #1: ...`
+- 检查 `.tasks/` 目录：生成了 `task_1.json`、`task_2.json`、`task_3.json` 三个文件
+- 每条任务 JSON 包含 `blockedBy: []`、`blocks: []`、`owner: ""` 字段
+
+### 案例 2：依赖链 + 完成自动解锁
+
+> 建立任务间的前后依赖关系，验证完成前置任务后自动解除阻塞。
+
+```
+让任务 2 依赖任务 1（任务 2 被任务 1 阻塞），然后把任务 1 标记为完成
+```
+
+观察要点：
+- 模型调用 `> task_update:` 设置 `addBlockedBy: [1]` 给任务 2
+- 调用 `> task_list:` 显示 `#2: ... (blocked by: [1])`，任务 2 被阻塞
+- 模型调用 `> task_update:` 设置任务 1 `status: "completed"`
+- 再次 `> task_list:`：任务 1 显示 `[x]`，任务 2 的 `(blocked by: [1])` **已消失**
+- 这是关键：完成任务 1 时，系统自动扫描所有任务文件，从它们的 `blockedBy` 中移除任务 1
+
+### 案例 3：Owner 分配 + 状态流转 + task_get 详情
+
+> 通过 owner 参数认领任务，并用 task_get 查看完整记录，验证状态全生命周期。
+
+```
+把任务 2 分配给 alice，标记为进行中，然后查看它的详细信息
+```
+
+观察要点：
+- 模型调用 `> task_update:` 同时设置 `owner: "alice"` 和 `status: "in_progress"`
+- 调用 `> task_get:` 返回任务 2 的完整 JSON 记录
+- JSON 中 `owner` 字段为 `"alice"`，`status` 为 `"in_progress"`
+- `> task_list:` 显示 `[>] #2: ... owner=alice`（状态标记和 owner 均正确显示）
+
+### 案例 4：Deleted 状态 + 持久化验证
+
+> 逻辑删除一个任务，验证文件保留和标记显示；重启验证任务持久化。
+
+先让模型创建一个不需要的任务：
+
+```
+创建一个任务叫"过时的设计稿"，然后把它标记为 deleted
+```
+
+观察要点：
+- 模型调用 `> task_update:` 设置 `status: "deleted"`
+- `> task_list:` 显示 `[-] #N: 过时的设计稿`（deleted 用 `[-]` 标记，文件仍保留在 `.tasks/`）
+- `.tasks/task_N.json` 文件仍然存在，`status` 字段为 `"deleted"`
+
+退出重启验证持久化：
+
+```sh
+# 退出当前会话（输入 q），重新启动
+mvn compile exec:java -Dexec.mainClass="com.example.agent.sessions.S12TaskSystem"
+```
+
+```
+列出所有任务
+```
+
+观察要点：
+- `> task_list:` 显示所有之前的任务（包括已完成 `[x]` 和已删除 `[-]`）
+- 这验证了"任务状态存在文件系统上，不怕上下文压缩或会话重启"
+
 ## 下一章学什么
 
 这一章解决的是：
