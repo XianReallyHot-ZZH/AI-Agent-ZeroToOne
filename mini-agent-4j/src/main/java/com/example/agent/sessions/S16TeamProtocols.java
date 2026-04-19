@@ -91,23 +91,72 @@ public class S16TeamProtocols {
     /** Teammate 最大输出 token 数 */
     private static final long TEAMMATE_MAX_TOKENS = 8000;
 
-    // ==================== 协议状态追踪器 ====================
+    // ==================== 协议请求持久化存储 ====================
+
+    private static RequestStore requestStore;
 
     /**
-     * Shutdown 请求追踪器。
-     * key = request_id, value = {target, status}
-     * status 取值：pending / approved / rejected
+     * 协议请求持久化存储。
+     * 每个请求以独立 JSON 文件存储在 .team/requests/{request_id}.json。
+     * 支持跨会话持久化：程序重启后协议状态仍然保留。
+     * <p>
+     * 对应 Python 原版：RequestStore 类。
      */
-    private static final ConcurrentHashMap<String, Map<String, Object>> shutdownRequests =
-            new ConcurrentHashMap<>();
+    public static class RequestStore {
+        private final Path dir;
+        private final Object lock = new Object();
 
-    /**
-     * Plan Approval 请求追踪器。
-     * key = request_id, value = {from, plan, status}
-     * status 取值：pending / approved / rejected
-     */
-    private static final ConcurrentHashMap<String, Map<String, Object>> planRequests =
-            new ConcurrentHashMap<>();
+        public RequestStore(Path baseDir) {
+            this.dir = baseDir;
+            try { Files.createDirectories(dir); } catch (Exception ignored) {}
+        }
+
+        private Path path(String requestId) {
+            return dir.resolve(requestId + ".json");
+        }
+
+        @SuppressWarnings("unchecked")
+        public Map<String, Object> create(Map<String, Object> record) {
+            String requestId = (String) record.get("request_id");
+            synchronized (lock) {
+                try {
+                    Files.writeString(path(requestId),
+                            MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(record));
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            }
+            return record;
+        }
+
+        @SuppressWarnings("unchecked")
+        public Map<String, Object> get(String requestId) {
+            Path p = path(requestId);
+            if (!Files.exists(p)) return null;
+            try {
+                return MAPPER.readValue(Files.readString(p), Map.class);
+            } catch (Exception e) {
+                return null;
+            }
+        }
+
+        @SuppressWarnings("unchecked")
+        public Map<String, Object> update(String requestId, Map<String, Object> changes) {
+            synchronized (lock) {
+                Map<String, Object> record = get(requestId);
+                if (record == null) return null;
+                record.putAll(changes);
+                record.put("updated_at", System.currentTimeMillis() / 1000.0);
+                try {
+                    Files.writeString(path(requestId),
+                            MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(record));
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+                return record;
+            }
+        }
+    }
 
     // ==================== ANSI 颜色输出 ====================
 
@@ -171,6 +220,7 @@ public class S16TeamProtocols {
         }
 
         if (baseUrl != null && !baseUrl.isBlank()) {
+            System.clearProperty("ANTHROPIC_AUTH_TOKEN");
             return AnthropicOkHttpClient.builder()
                     .apiKey(apiKey)
                     .baseUrl(baseUrl)
@@ -583,10 +633,14 @@ public class S16TeamProtocols {
          * @return 广播结果描述
          */
         public String broadcast(String from, String content, List<String> recipients) {
+            int count = 0;
             for (String to : recipients) {
-                send(from, to, content, "broadcast", null);
+                if (!to.equals(from)) {
+                    send(from, to, content, "broadcast", null);
+                    count++;
+                }
             }
-            return "Broadcast to " + recipients.size() + " teammates";
+            return "Broadcast to " + count + " teammates";
         }
     }
 
@@ -825,7 +879,7 @@ public class S16TeamProtocols {
                                     "content", Map.of("type", "string"),
                                     "msg_type", Map.of("type", "string",
                                             "enum", List.of("message", "broadcast", "shutdown_request",
-                                                    "shutdown_response", "plan_approval_response"))),
+                                                    "shutdown_response", "plan_approval", "plan_approval_response"))),
                             List.of("to", "content")),
                     defineTool("read_inbox", "Read and drain your inbox.",
                             Map.of(), null),
@@ -913,10 +967,16 @@ public class S16TeamProtocols {
                 boolean approve = Boolean.TRUE.equals(input.get("approve"));
                 String reason = (String) input.getOrDefault("reason", "");
 
-                // 更新 shutdown tracker 状态
-                var req = shutdownRequests.get(reqId);
-                if (req != null) {
-                    req.put("status", approve ? "approved" : "rejected");
+                // 更新 request store 状态
+                String status = approve ? "approved" : "rejected";
+                Map<String, Object> changes = new LinkedHashMap<>();
+                changes.put("status", status);
+                changes.put("resolved_by", name);
+                changes.put("resolved_at", System.currentTimeMillis() / 1000.0);
+                changes.put("response", Map.of("approve", approve, "reason", reason));
+                var updated = requestStore.update(reqId, changes);
+                if (updated == null) {
+                    return "Error: Unknown shutdown request " + reqId;
                 }
 
                 // 发送响应消息到 lead 的收件箱
@@ -929,12 +989,20 @@ public class S16TeamProtocols {
             // plan_approval：队友提交计划等待审批
             // 创建 request_id + 发送到 lead 收件箱
             toolHandlers.put("plan_approval", input -> {
-                String planText = (String) input.get("plan");
+                String planText = (String) input.getOrDefault("plan", "");
                 String reqId = UUID.randomUUID().toString().substring(0, 8);
+                double now = System.currentTimeMillis() / 1000.0;
 
-                // 记录到 plan tracker
-                planRequests.put(reqId, new ConcurrentHashMap<>(Map.of(
-                        "from", name, "plan", planText, "status", "pending")));
+                // 创建持久化请求记录
+                requestStore.create(new LinkedHashMap<>(Map.of(
+                        "request_id", reqId,
+                        "kind", "plan_approval",
+                        "from", name,
+                        "to", "lead",
+                        "status", "pending",
+                        "plan", planText,
+                        "created_at", now,
+                        "updated_at", now)));
 
                 // 发送到 lead 收件箱
                 bus.send(name, "lead", planText, "plan_approval",
@@ -1042,8 +1110,17 @@ public class S16TeamProtocols {
      */
     private static String handleShutdownRequest(String teammate, MessageBus bus) {
         String reqId = UUID.randomUUID().toString().substring(0, 8);
-        shutdownRequests.put(reqId, new ConcurrentHashMap<>(Map.of(
-                "target", teammate, "status", "pending")));
+        double now = System.currentTimeMillis() / 1000.0;
+
+        requestStore.create(new LinkedHashMap<>(Map.of(
+                "request_id", reqId,
+                "kind", "shutdown",
+                "from", "lead",
+                "to", teammate,
+                "status", "pending",
+                "created_at", now,
+                "updated_at", now)));
+
         bus.send("lead", teammate, "Please shut down gracefully.",
                 "shutdown_request", Map.of("request_id", reqId));
         return "Shutdown request " + reqId + " sent to '" + teammate + "' (status: pending)";
@@ -1060,7 +1137,7 @@ public class S16TeamProtocols {
      * @return 状态 JSON 字符串
      */
     private static String checkShutdownStatus(String requestId) {
-        var req = shutdownRequests.get(requestId);
+        var req = requestStore.get(requestId);
         if (req == null) return "{\"error\": \"not found\"}";
         try {
             return MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(req);
@@ -1085,20 +1162,24 @@ public class S16TeamProtocols {
      */
     private static String handlePlanReview(String requestId, boolean approve,
                                            String feedback, MessageBus bus) {
-        var req = planRequests.get(requestId);
+        var req = requestStore.get(requestId);
         if (req == null) return "Error: Unknown plan request_id '" + requestId + "'";
 
-        // 更新状态
-        req.put("status", approve ? "approved" : "rejected");
+        String status = approve ? "approved" : "rejected";
+        String fb = feedback != null ? feedback : "";
 
-        // 发送审批结果给提交者
+        Map<String, Object> changes = new LinkedHashMap<>();
+        changes.put("status", status);
+        changes.put("reviewed_by", "lead");
+        changes.put("resolved_at", System.currentTimeMillis() / 1000.0);
+        changes.put("feedback", fb);
+        requestStore.update(requestId, changes);
+
         bus.send("lead", (String) req.get("from"),
-                feedback != null ? feedback : "",
-                "plan_approval_response",
-                Map.of("request_id", requestId, "approve", approve,
-                        "feedback", feedback != null ? feedback : ""));
+                fb, "plan_approval_response",
+                Map.of("request_id", requestId, "approve", approve, "feedback", fb));
 
-        return "Plan " + req.get("status") + " for '" + req.get("from") + "'";
+        return "Plan " + status + " for '" + req.get("from") + "'";
     }
 
     // ==================== Agent 核心循环 ====================
@@ -1227,6 +1308,7 @@ public class S16TeamProtocols {
         // ---- 2. 初始化消息总线和队友管理器 ----
         Path teamDir = WORK_DIR.resolve(".team");
         MessageBus bus = new MessageBus(teamDir.resolve("inbox"));
+        requestStore = new RequestStore(teamDir.resolve("requests"));
         TeammateManager teammateManager = new TeammateManager(teamDir, bus, client, model);
 
         // ---- 3. Lead 系统提示词 ----
