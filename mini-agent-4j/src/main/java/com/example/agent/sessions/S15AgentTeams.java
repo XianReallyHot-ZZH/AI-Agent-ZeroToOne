@@ -108,7 +108,8 @@ public class S15AgentTeams {
     /** 有效消息类型集合 */
     private static final Set<String> VALID_MSG_TYPES = Set.of(
             "message", "broadcast", "shutdown_request",
-            "shutdown_response", "plan_approval_response"
+            "shutdown_response", "plan_approval",
+            "plan_approval_response"
     );
 
     /** ANSI 重置码 */
@@ -228,7 +229,7 @@ public class S15AgentTeams {
                                 "msg_type", Map.of("type", "string",
                                         "enum", List.of("message", "broadcast",
                                                 "shutdown_request", "shutdown_response",
-                                                "plan_approval_response"))),
+                                                "plan_approval", "plan_approval_response"))),
                         List.of("to", "content")),
                 defineTool("read_inbox", "Read and drain the lead's inbox.",
                         Map.of(), null),
@@ -846,10 +847,9 @@ public class S15AgentTeams {
         private void teammateLoop(String name, String role, String prompt) {
             // ---- 构建系统提示词 ----
             // 告诉 teammate 它是谁、什么角色、在哪个团队
-            String teamName = (String) config.getOrDefault("team_name", "default");
             String sysPrompt = "You are '" + name + "', role: " + role
-                    + ", team: " + teamName + ", at " + WORKDIR + ". "
-                    + "Do your assigned work, then stop.";
+                    + ", at " + WORKDIR + ". "
+                    + "Use send_message to communicate. Complete your task.";
 
             // ---- 构建 teammate 参数 ----
             // 每个 teammate 有自己独立的 paramsBuilder（对话历史）
@@ -878,7 +878,11 @@ public class S15AgentTeams {
                             List.of("path", "old_text", "new_text")),
                     defineTool("send_message", "Send message to a teammate.",
                             Map.of("to", Map.of("type", "string"),
-                                    "content", Map.of("type", "string")),
+                                    "content", Map.of("type", "string"),
+                                    "msg_type", Map.of("type", "string",
+                                            "enum", List.of("message", "broadcast",
+                                                    "shutdown_request", "shutdown_response",
+                                                    "plan_approval", "plan_approval_response"))),
                             List.of("to", "content")),
                     defineTool("read_inbox", "Read and drain your inbox.",
                             Map.of(), null)
@@ -960,11 +964,10 @@ public class S15AgentTeams {
                     params.addUserMessageOfBlockParams(results);
 
                 } catch (Exception e) {
-                    // 发生异常时打印错误并退出
+                    // 发生异常时打印错误并退出循环
                     System.out.println(printRed(
                             "  [" + name + "] Error: " + e.getMessage()));
-                    setMemberStatus(name, "shutdown");
-                    return;
+                    break;
                 }
             }
 
@@ -1003,7 +1006,8 @@ public class S15AgentTeams {
                         name,
                         (String) input.get("to"),
                         (String) input.get("content"),
-                        "message", null);
+                        (String) input.getOrDefault("msg_type", "message"),
+                        null);
                 case "read_inbox" -> {
                     try {
                         List<Map<String, Object>> msgs = bus.readInbox(name);
