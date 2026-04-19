@@ -95,10 +95,12 @@ public class S12TaskSystem {
                 defineTool("task_get", "Get full details of a task by ID.",
                         Map.of("task_id", Map.of("type", "integer")),
                         List.of("task_id")),
-                defineTool("task_update", "Update a task's status or dependencies.",
+                defineTool("task_update", "Update a task's status, owner, or dependencies.",
                         Map.of("task_id", Map.of("type", "integer"),
                                 "status", Map.of("type", "string",
                                         "enum", List.of("pending", "in_progress", "completed", "deleted")),
+                                "owner", Map.of("type", "string",
+                                        "description", "Set when a teammate claims the task"),
                                 "addBlockedBy", Map.of("type", "array",
                                         "items", Map.of("type", "integer")),
                                 "addBlocks", Map.of("type", "array",
@@ -125,7 +127,7 @@ public class S12TaskSystem {
             @SuppressWarnings("unchecked")
             List<Integer> blocks = (List<Integer>) input.get("addBlocks");
             return taskMgr.update(((Number) input.get("task_id")).intValue(),
-                    (String) input.get("status"), blockedBy, blocks);
+                    (String) input.get("status"), (String) input.get("owner"), blockedBy, blocks);
         });
         handlers.put("task_list", input -> taskMgr.listAll());
 
@@ -255,7 +257,7 @@ public class S12TaskSystem {
             task.put("subject", subject);
             task.put("description", description != null ? description : "");
             task.put("status", "pending");
-            task.put("owner", null);
+            task.put("owner", "");
             task.put("blockedBy", new ArrayList<Integer>());
             task.put("blocks", new ArrayList<Integer>());
             save(task);
@@ -271,9 +273,15 @@ public class S12TaskSystem {
          * 更新任务。完成时自动解除依赖。
          */
         @SuppressWarnings("unchecked")
-        String update(int taskId, String status, List<Integer> addBlockedBy, List<Integer> addBlocks) {
+        String update(int taskId, String status, String owner, List<Integer> addBlockedBy, List<Integer> addBlocks) {
             var task = load(taskId);
+            if (owner != null) {
+                task.put("owner", owner);
+            }
             if (status != null) {
+                if (!List.of("pending", "in_progress", "completed", "deleted").contains(status)) {
+                    return "Error: Invalid status: " + status;
+                }
                 task.put("status", status);
                 // 完成任务时，自动从其他任务的 blockedBy 中移除此任务
                 if ("completed".equals(status)) {
@@ -288,36 +296,11 @@ public class S12TaskSystem {
                                 });
                     } catch (IOException ignored) {}
                 }
-                // 删除任务
-                if ("deleted".equals(status)) {
-                    try { Files.deleteIfExists(TASKS_DIR.resolve("task_" + taskId + ".json")); }
-                    catch (IOException ignored) {}
-                    return "Task " + taskId + " deleted";
-                }
             }
             if (addBlockedBy != null) {
                 List<Integer> bb = (List<Integer>) task.getOrDefault("blockedBy", new ArrayList<>());
                 bb.addAll(addBlockedBy);
-                // 去重：LinkedHashSet 保持插入顺序的同时去除重复依赖
                 task.put("blockedBy", new ArrayList<>(new LinkedHashSet<>(bb)));
-
-                // ---- 双向 DAG 维护：正向边（blockedBy）→ 反向边（blocks）----
-                // 当前任务声明 "我被 blockerId 阻塞" 时，
-                // 需要同步在 blockerId 的 "blocks" 列表中添加当前任务，
-                // 这样完成任务时只需查 blocker 的 blocks 列表就知道该解锁谁。
-                for (int blockerId : addBlockedBy) {
-                    try {
-                        var blocker = load(blockerId);
-                        List<Integer> blockerBlocks = (List<Integer>) blocker.getOrDefault("blocks", new ArrayList<>());
-                        if (!blockerBlocks.contains(taskId)) {
-                            blockerBlocks.add(taskId);
-                            blocker.put("blocks", new ArrayList<>(new LinkedHashSet<>(blockerBlocks)));
-                            save(blocker);
-                        }
-                    } catch (IllegalArgumentException ignored) {
-                        // 依赖的阻塞任务不存在，跳过（允许悬空依赖）
-                    }
-                }
             }
             if (addBlocks != null) {
                 List<Integer> bl = (List<Integer>) task.getOrDefault("blocks", new ArrayList<>());
@@ -364,13 +347,15 @@ public class S12TaskSystem {
                         case "pending" -> "[ ]";
                         case "in_progress" -> "[>]";
                         case "completed" -> "[x]";
+                        case "deleted" -> "[-]";
                         default -> "[?]";
                     };
-                    String owner = t.get("owner") != null ? " @" + t.get("owner") : "";
+                    String ownerStr = t.get("owner") != null && !((String) t.get("owner")).isEmpty()
+                            ? " owner=" + t.get("owner") : "";
                     @SuppressWarnings("unchecked")
                     List<Integer> bb = (List<Integer>) t.getOrDefault("blockedBy", List.of());
                     String blocked = bb.isEmpty() ? "" : " (blocked by: " + bb + ")";
-                    lines.add(m + " #" + t.get("id") + ": " + t.get("subject") + owner + blocked);
+                    lines.add(m + " #" + t.get("id") + ": " + t.get("subject") + ownerStr + blocked);
                 }
                 return String.join("\n", lines);
             } catch (IOException e) { return "Error: " + e.getMessage(); }
