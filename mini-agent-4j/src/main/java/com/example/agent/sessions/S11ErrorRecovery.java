@@ -178,6 +178,8 @@ public class S11ErrorRecovery {
         }
 
         if (baseUrl != null && !baseUrl.isBlank()) {
+            // 与 Python 原版对齐：自定义 baseUrl 时清除 ANTHROPIC_AUTH_TOKEN 避免冲突
+            System.clearProperty("ANTHROPIC_AUTH_TOKEN");
             return AnthropicOkHttpClient.builder()
                     .apiKey(apiKey)
                     .baseUrl(baseUrl)
@@ -532,7 +534,7 @@ public class S11ErrorRecovery {
         // 将对话日志拼接为文本，截取最后 80000 字符
         String conversationText = String.join("\n", conversationLog);
         if (conversationText.length() > 80000) {
-            conversationText = conversationText.substring(conversationText.length() - 80000);
+            conversationText = conversationText.substring(0, 80000);
         }
 
         // 构造摘要提示词（与 Python 原版一致）
@@ -721,8 +723,27 @@ public class S11ErrorRecovery {
                         return;
                     }
 
-                    // ---- 其他异常（编程 bug）-> 不重试，直接抛出 ----
-                    throw new RuntimeException("Unexpected error (likely a bug): " + e.getMessage(), e);
+                    // ---- 策略 3b：其他 API 错误（rate limit、server error 等）-> 退避重试 ----
+                    // 与 Python 原版对齐：非 prompt_too_long 的 APIError 也执行退避
+                    if (attempt < MAX_RECOVERY_ATTEMPTS) {
+                        double delay = backoffDelay(attempt);
+                        System.out.println(yellow("[Recovery] API error: " + e.getMessage()
+                                + ". Retrying in " + String.format("%.1f", delay) + "s"
+                                + " (attempt " + (attempt + 1) + "/" + MAX_RECOVERY_ATTEMPTS + ")"));
+                        try {
+                            Thread.sleep((long) (delay * 1000));
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                            System.err.println(red("[Error] Interrupted during backoff."));
+                            return;
+                        }
+                        continue;
+                    }
+
+                    // 所有重试耗尽
+                    System.err.println(red("[Error] API call failed after "
+                            + MAX_RECOVERY_ATTEMPTS + " retries: " + e.getMessage()));
+                    return;
                 }
             }
 

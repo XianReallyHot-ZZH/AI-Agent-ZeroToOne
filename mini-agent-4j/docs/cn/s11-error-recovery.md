@@ -375,16 +375,84 @@ for (int attempt = 0; attempt <= MAX_RECOVERY_ATTEMPTS; attempt++) {
 
 ## 试一试
 
+### 启动
+
 ```sh
 cd mini-agent-4j
 mvn compile exec:java -Dexec.mainClass="com.example.agent.sessions.S11ErrorRecovery"
 ```
 
-可以试试这些任务：
+启动时观察 dim 输出：`Recovery attempts: 3, backoff base: 1.0s, max: 30.0s, token threshold: 50000`。
 
-1. 让模型生成一段特别长的内容，观察它是否会自动续写。
-2. 连续读取一些大文件，观察上下文压缩是否会介入。
-3. 临时制造一次请求失败，观察系统是否会退避重试。
+### 案例 1：正常操作基线（无恢复触发）
+
+> 执行一个简单任务，验证恢复系统不干扰正常工作流。
+
+```
+帮我列出当前目录下的文件
+```
+
+观察要点：
+- 工具正常执行，输出 `> bash:` 或 `> read_file:` 日志
+- **没有**黄色 `[Recovery]` 日志出现 —— 正常操作不触发恢复路径
+- 主循环行为与 S02 完全一致，恢复逻辑是透明旁路
+
+### 案例 2：长输出触发 max_tokens 恢复（策略 1）
+
+> 请求模型生成一段特别长的内容，观察输出被截断后的续写恢复。
+
+```
+请帮我逐行详细解释 pom.xml 的每一个依赖，格式为：依赖名 → 用途 → 为什么需要它。输出要尽可能详细。
+```
+
+观察要点：
+- 如果模型输出被截断（`stopReason == MAX_TOKENS`），日志出现 `[Recovery] max_tokens hit (1/3). Injecting continuation...`
+- 系统自动注入续写消息 `"Output limit hit. Continue directly..."`，模型从中断点继续输出
+- 计数器在成功恢复后重置为 0
+- 最多续写 3 次，超过后打印 `[Error] max_tokens recovery exhausted`
+
+### 案例 3：Token 累积触发主动 auto-compact（策略 2 预防式）
+
+> 连续读取多个文件，累积 token 估算值超过 50000 阈值，观察主动压缩介入。
+
+```
+依次读取 src/main/java/com/example/agent/sessions/ 下每个 Java 文件的前 50 行，帮我统计每个 Session 的功能
+```
+
+观察要点：
+- 前几次 read_file 正常执行，每次工具输出累加到 tokenEstimate
+- 当估算值超过 50000 时，日志自动出现 `[Recovery] Token estimate exceeds threshold. Auto-compacting...`
+- 这是**预防式**压缩——不等 prompt 真的过长报错，而是提前压缩
+- 压缩后 agent 继续工作，不会丢失"已读了哪些文件"的上下文
+
+### 案例 4：理解恢复流水线的完整结构
+
+> 通过构造不同场景，理解三条恢复路径的优先级和触发条件。
+
+先验证策略 2 的**被动式**触发（如果 API 返回 prompt 过长错误）：
+
+```
+读取 pom.xml 的全部内容，然后重复告诉我 50 遍它的内容
+```
+
+观察要点：
+- 如果 API 返回 prompt 过长错误，日志出现 `[Recovery] Prompt too long. Compacting... (attempt N)`
+- 压缩后自动重试，不需要用户干预
+- 与案例 3 的区别：案例 3 是预防式（超阈值就压缩），这里是被动式（API 拒绝后才压缩）
+
+如果网络出现临时错误（策略 3）：
+
+观察要点：
+- 日志出现 `[Recovery] Network error: ... Retrying in Xs (attempt N/3)` 或 `[Recovery] API error: ... Retrying in Xs`
+- 退避时间指数增长：约 1s → 2s → 4s（加随机抖动）
+- 这是策略 3b：非 prompt_too_long 的 API 错误（如 rate limit、server error）也会退避重试
+
+三条路径的优先级总结：
+```
+1. prompt_too_long → 立即压缩，重试（不等待）
+2. 网络错误/API 错误 → 退避等待，重试
+3. 所有重试耗尽 → 打印错误，优雅退出
+```
 
 读这一章时，你真正要记住的不是某个具体异常名，而是这条主线：
 
